@@ -1585,7 +1585,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .applicationVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0",
             .version: Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1",
             .credits: NSAttributedString(
-                string: "A tiny macOS menu bar companion for watching memory usage, pressure state, swap activity, and top memory processes.",
+                string: "A tiny macOS menu bar companion for watching memory usage, pressure state, swap activity, top processes, and temporary CPU controls.",
                 attributes: [.font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)]
             )
         ]

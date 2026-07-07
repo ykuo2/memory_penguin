@@ -2,7 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-APP_DIR="$ROOT_DIR/dist/MemoryPenguin.app"
+DIST_APP_DIR="$ROOT_DIR/dist/MemoryPenguin.app"
+STAGING_ROOT="${TMPDIR:-/tmp}/memory-penguin-build"
+APP_DIR="$STAGING_ROOT/MemoryPenguin.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 ICONSET_DIR="$ROOT_DIR/.build/AppIcon.iconset"
 INFO_PLIST="$ROOT_DIR/Resources/Info.plist"
@@ -14,7 +16,7 @@ SHORT_VERSION="$CURRENT_VERSION"
 
 swift build -c release
 
-rm -rf "$APP_DIR"
+rm -rf "$STAGING_ROOT"
 mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
 cp "$ROOT_DIR/.build/release/MemoryPenguin" "$CONTENTS_DIR/MacOS/MemoryPenguin"
 cp "$INFO_PLIST" "$CONTENTS_DIR/Info.plist"
@@ -39,4 +41,8 @@ iconutil -c icns "$ICONSET_DIR" -o "$CONTENTS_DIR/Resources/AppIcon.icns"
 xattr -cr "$APP_DIR"
 codesign --force --deep --sign - "$APP_DIR" >/dev/null
 
-echo "Built $APP_DIR (version $SHORT_VERSION, build $BUILD_NUMBER)"
+rm -rf "$DIST_APP_DIR"
+mkdir -p "$(dirname "$DIST_APP_DIR")"
+ditto --noextattr "$APP_DIR" "$DIST_APP_DIR"
+
+echo "Built $DIST_APP_DIR (version $SHORT_VERSION, build $BUILD_NUMBER)"
