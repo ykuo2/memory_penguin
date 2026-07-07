@@ -17,6 +17,7 @@ This project uses Swift + AppKit because it is the best fit for a lightweight ma
 - Shows or hides the percentage in the menu bar with the `Show Percentage` menu item.
 - Enables or disables opening at login with the `Launch at Login` menu item.
 - Displays total, used, available, app memory, cache, file-backed cache, anonymous, free, active, inactive, wired, compressed, purgeable, speculative, page-out rate, swap traffic rate, swap memory values, plus separate top memory and top CPU process lists.
+- Lets you click a top CPU process to add it to a temporary limited process list with background priority or 75%, 50%, and 25% throttle modes.
 - Shows or hides detailed memory sections with the `Show Detailed Memory Info` menu item.
 - Uses three minimalist Adelie-inspired icon states:
   - Green short mark: calm pressure.
@@ -43,6 +44,11 @@ The menu bar percentage is memory usage, not a private Activity Monitor pressure
 Memory counters and pressure state are read through macOS VM and sysctl APIs. Process lists are read from a lightweight `ps` snapshot, then sorted in the app.
 
 When the menu is closed, Memory Penguin refreshes lightweight status data every 2 seconds and does not read the process list. When the menu is open, it refreshes every second and reads process data in the background to update the five visible memory processes and five visible CPU processes without blocking the menu.
+
+CPU process limiting is session-based and applies to the selected PID. `Background Priority` uses macOS `taskpolicy`; percentage throttle modes use short `SIGSTOP` / `SIGCONT` cycles, so heavily throttled apps may become temporarily unresponsive. Memory Penguin resumes throttled processes when their limit is removed or the app quits.
+
+Memory Penguin excludes its own process from CPU limiting so it cannot pause or throttle itself.
+Clicking a checked process in the top CPU list removes it from the limited process list.
 
 ## Build
 
@@ -73,4 +79,19 @@ For regular use, prefer the `.app` bundle so `LSUIElement` is applied and the ap
 
 For `Launch at Login`, move `dist/MemoryPenguin.app` into `/Applications` first. The build script ad-hoc signs the local bundle so macOS can register it as a login item.
 
-Each release build automatically increments the patch component of `CFBundleShortVersionString` and updates `CFBundleVersion` to a timestamp build number.
+Each release build uses `CFBundleShortVersionString` from `Resources/Info.plist` and updates the bundled `CFBundleVersion` to a timestamp build number.
+
+## CPU Limit Testing
+
+Run the included CPU stress test, then open Memory Penguin and add `CPUStressTest` from the top CPU process list:
+
+```bash
+swiftc Scripts/CPUStressTest.swift -o /tmp/CPUStressTest
+/tmp/CPUStressTest --workers 2 --seconds 120
+```
+
+You can also run it as a Swift script:
+
+```bash
+Scripts/CPUStressTest.swift --workers 2 --seconds 120
+```

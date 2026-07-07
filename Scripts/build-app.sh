@@ -10,15 +10,7 @@ BUILD_NUMBER="$(date +%Y%m%d%H%M)"
 
 cd "$ROOT_DIR"
 CURRENT_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$INFO_PLIST")"
-IFS='.' read -r VERSION_MAJOR VERSION_MINOR VERSION_PATCH <<< "$CURRENT_VERSION"
-VERSION_MAJOR="${VERSION_MAJOR:-0}"
-VERSION_MINOR="${VERSION_MINOR:-0}"
-VERSION_PATCH="${VERSION_PATCH:-0}"
-if [[ ! "$VERSION_PATCH" =~ ^[0-9]+$ ]]; then
-    VERSION_PATCH=0
-fi
-SHORT_VERSION="$VERSION_MAJOR.$VERSION_MINOR.$((VERSION_PATCH + 1))"
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $SHORT_VERSION" "$INFO_PLIST"
+SHORT_VERSION="$CURRENT_VERSION"
 
 swift build -c release
 

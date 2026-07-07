@@ -33,6 +33,47 @@ struct ProcessSnapshot: Sendable {
     let topCPUProcesses: [ProcessMemorySnapshot]
 }
 
+enum ProcessLimitMode: Equatable {
+    case background
+    case throttle(Double)
+
+    var title: String {
+        switch self {
+        case .background:
+            return "Background Priority"
+        case .throttle(let allowedCPU):
+            return "Throttle to \(Int((allowedCPU * 100).rounded()))%"
+        }
+    }
+}
+
+struct LimitedProcess {
+    let pid: Int
+    let name: String
+    var mode: ProcessLimitMode
+    var modeStartedAt: Date
+    var isRunning: Bool
+    var hasBackgroundPolicy: Bool
+}
+
+private final class ProcessMenuSelection: NSObject {
+    let process: ProcessMemorySnapshot
+
+    init(process: ProcessMemorySnapshot) {
+        self.process = process
+    }
+}
+
+private final class ProcessLimitMenuSelection: NSObject {
+    let pid: Int
+    let mode: ProcessLimitMode?
+
+    init(pid: Int, mode: ProcessLimitMode?) {
+        self.pid = pid
+        self.mode = mode
+    }
+}
+
 struct SwapSnapshot {
     let total: UInt64
     let used: UInt64
@@ -326,6 +367,10 @@ enum ProcessMemoryReader {
     }
 
     private static func isExcluded(_ process: ProcessMemorySnapshot) -> Bool {
+        if process.pid == Int(Darwin.getpid()) {
+            return true
+        }
+
         let normalizedName = process.name
             .lowercased()
             .replacingOccurrences(of: "_", with: "")
@@ -730,6 +775,63 @@ enum LoginItemController {
     }
 }
 
+enum ProcessLimiter {
+    static func setBackgroundPolicy(pid: Int, enabled: Bool) throws {
+        let task = Foundation.Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/taskpolicy")
+        task.arguments = [enabled ? "-b" : "-B", "-p", "\(pid)"]
+
+        let errorPipe = Pipe()
+        task.standardError = errorPipe
+
+        do {
+            try task.run()
+        } catch {
+            throw NSError(
+                domain: "MemoryPenguin.ProcessLimiter",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Unable to run taskpolicy for PID \(pid)."]
+            )
+        }
+
+        task.waitUntilExit()
+        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        errorPipe.fileHandleForReading.closeFile()
+
+        guard task.terminationStatus == 0 else {
+            let message = String(data: errorData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw NSError(
+                domain: "MemoryPenguin.ProcessLimiter",
+                code: Int(task.terminationStatus),
+                userInfo: [
+                    NSLocalizedDescriptionKey: message?.isEmpty == false
+                        ? message!
+                        : "taskpolicy failed for PID \(pid)."
+                ]
+            )
+        }
+    }
+
+    static func processExists(pid: Int) -> Bool {
+        Darwin.kill(pid_t(pid), 0) == 0 || errno == EPERM
+    }
+
+    @discardableResult
+    static func resume(pid: Int) -> Bool {
+        send(signal: SIGCONT, pid: pid)
+    }
+
+    @discardableResult
+    static func suspend(pid: Int) -> Bool {
+        send(signal: SIGSTOP, pid: pid)
+    }
+
+    private static func send(signal: Int32, pid: Int) -> Bool {
+        Darwin.kill(pid_t(pid), signal) == 0
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private enum DefaultsKey {
@@ -769,11 +871,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let activitySeparatorItem = NSMenuItem.separator()
     private let processesSeparatorItem = NSMenuItem.separator()
     private let cpuProcessesSeparatorItem = NSMenuItem.separator()
+    private let limitedProcessesSeparatorItem = NSMenuItem.separator()
     private let controlsSeparatorItem = NSMenuItem.separator()
     private let topProcessesTitleItem = AppDelegate.makeDisabledItem("Top Memory Processes")
     private let processItems = (0..<5).map { _ in AppDelegate.makeDisabledItem() }
     private let topCPUProcessesTitleItem = AppDelegate.makeDisabledItem("Top CPU Processes")
     private let cpuProcessItems = (0..<5).map { _ in AppDelegate.makeDisabledItem() }
+    private let limitedProcessesTitleItem = AppDelegate.makeDisabledItem("Limited Processes")
+    private let noLimitedProcessesItem = AppDelegate.makeDisabledItem("No limited processes")
     private let togglePercentageItem = NSMenuItem(
         title: "Show Percentage",
         action: #selector(togglePercentageVisibility),
@@ -803,6 +908,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isProcessRefreshInFlight = false
     private var processRefreshGeneration = 0
     private var hasProcessSnapshot = false
+    private var limitedProcesses: [Int: LimitedProcess] = [:]
+    private var limitedProcessOrder: [Int] = []
+    private var limitedProcessMenuItems: [NSMenuItem] = []
+    private var processLimitTimer: Timer?
     private var latestSnapshot: MemorySnapshot?
     private var showsPercentage: Bool {
         get {
@@ -866,12 +975,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startTimer(interval: RefreshInterval.menuClosed)
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        for pid in Array(limitedProcessOrder) {
+            removeProcessLimit(pid: pid, shouldResetPolicy: true, shouldRefreshMenu: false)
+        }
+        processLimitTimer?.invalidate()
+        processLimitTimer = nil
+    }
+
     @objc private func refresh() {
         do {
             let snapshot = try MemoryReader.current().withActivityRates(comparedTo: latestSnapshot)
             latestSnapshot = snapshot
             updateStatusItem(with: snapshot)
             updateMenu(with: snapshot)
+            pruneExitedLimitedProcesses()
             if isMenuOpen {
                 requestProcessRefresh()
             }
@@ -948,8 +1066,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if index < processes.count {
                 let process = processes[index]
                 cpuProcessItems[index].title = "\(index + 1). \(process.name): \(ByteFormatter.percent(process.cpu))"
+                cpuProcessItems[index].target = self
+                cpuProcessItems[index].action = #selector(addCPUProcessToLimits(_:))
+                cpuProcessItems[index].representedObject = ProcessMenuSelection(process: process)
+                cpuProcessItems[index].isEnabled = true
+                cpuProcessItems[index].state = limitedProcesses[process.pid] == nil ? .off : .on
             } else {
                 cpuProcessItems[index].title = "\(index + 1). --"
+                cpuProcessItems[index].target = nil
+                cpuProcessItems[index].action = nil
+                cpuProcessItems[index].representedObject = nil
+                cpuProcessItems[index].isEnabled = false
+                cpuProcessItems[index].state = .off
             }
         }
     }
@@ -992,6 +1120,285 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateProcesses(snapshot)
     }
 
+    @objc private func addCPUProcessToLimits(_ sender: NSMenuItem) {
+        guard let selection = sender.representedObject as? ProcessMenuSelection else {
+            return
+        }
+
+        let process = selection.process
+        guard process.pid != Int(Darwin.getpid()) else {
+            showErrorAlert(
+                title: "Unable to Limit Process",
+                message: "Memory Penguin cannot add itself to the limited process list."
+            )
+            return
+        }
+
+        guard ProcessLimiter.processExists(pid: process.pid) else {
+            showErrorAlert(title: "Process Has Exited", message: "\(process.name) is no longer running.")
+            return
+        }
+
+        if limitedProcesses[process.pid] != nil {
+            removeProcessLimit(pid: process.pid, shouldResetPolicy: true, shouldRefreshMenu: true)
+            return
+        }
+
+        do {
+            try ProcessLimiter.setBackgroundPolicy(pid: process.pid, enabled: true)
+            limitedProcesses[process.pid] = LimitedProcess(
+                pid: process.pid,
+                name: process.name,
+                mode: .background,
+                modeStartedAt: Date(),
+                isRunning: true,
+                hasBackgroundPolicy: true
+            )
+            limitedProcessOrder.append(process.pid)
+            rebuildLimitedProcessItems()
+            updateCPUProcesses(
+                cpuProcessItems.compactMap { ($0.representedObject as? ProcessMenuSelection)?.process }
+            )
+        } catch {
+            showErrorAlert(
+                title: "Unable to Limit Process",
+                message: "\(process.name) could not be moved to background priority.\n\n\(error.localizedDescription)"
+            )
+        }
+    }
+
+    @objc private func changeProcessLimitMode(_ sender: NSMenuItem) {
+        guard let selection = sender.representedObject as? ProcessLimitMenuSelection,
+              let mode = selection.mode else {
+            return
+        }
+
+        do {
+            try applyLimitMode(mode, to: selection.pid)
+            rebuildLimitedProcessItems()
+        } catch {
+            showErrorAlert(
+                title: "Unable to Change Process Limit",
+                message: error.localizedDescription
+            )
+        }
+    }
+
+    @objc private func removeProcessLimit(_ sender: NSMenuItem) {
+        guard let selection = sender.representedObject as? ProcessLimitMenuSelection else {
+            return
+        }
+
+        removeProcessLimit(pid: selection.pid, shouldResetPolicy: true, shouldRefreshMenu: true)
+    }
+
+    private func applyLimitMode(_ mode: ProcessLimitMode, to pid: Int) throws {
+        guard var process = limitedProcesses[pid] else {
+            return
+        }
+        guard ProcessLimiter.processExists(pid: pid) else {
+            removeProcessLimit(pid: pid, shouldResetPolicy: false, shouldRefreshMenu: true)
+            return
+        }
+
+        if !process.hasBackgroundPolicy {
+            try ProcessLimiter.setBackgroundPolicy(pid: pid, enabled: true)
+            process.hasBackgroundPolicy = true
+        }
+
+        switch mode {
+        case .background:
+            ProcessLimiter.resume(pid: pid)
+            process.isRunning = true
+        case .throttle:
+            guard ProcessLimiter.resume(pid: pid) else {
+                throw NSError(
+                    domain: "MemoryPenguin.ProcessLimiter",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "Memory Penguin cannot send control signals to PID \(pid)."]
+                )
+            }
+            process.isRunning = true
+        }
+
+        process.mode = mode
+        process.modeStartedAt = Date()
+        limitedProcesses[pid] = process
+        updateProcessLimitTimer()
+    }
+
+    private func removeProcessLimit(pid: Int, shouldResetPolicy: Bool, shouldRefreshMenu: Bool) {
+        if let process = limitedProcesses[pid], !process.isRunning {
+            ProcessLimiter.resume(pid: pid)
+        }
+
+        if shouldResetPolicy, limitedProcesses[pid]?.hasBackgroundPolicy == true {
+            try? ProcessLimiter.setBackgroundPolicy(pid: pid, enabled: false)
+        }
+
+        limitedProcesses.removeValue(forKey: pid)
+        limitedProcessOrder.removeAll { $0 == pid }
+        updateProcessLimitTimer()
+
+        if shouldRefreshMenu {
+            rebuildLimitedProcessItems()
+            updateCPUProcesses(
+                cpuProcessItems.compactMap { ($0.representedObject as? ProcessMenuSelection)?.process }
+            )
+        }
+    }
+
+    private func pruneExitedLimitedProcesses() {
+        var didRemoveProcess = false
+
+        for pid in Array(limitedProcessOrder) where !ProcessLimiter.processExists(pid: pid) {
+            removeProcessLimit(pid: pid, shouldResetPolicy: false, shouldRefreshMenu: false)
+            didRemoveProcess = true
+        }
+
+        if didRemoveProcess {
+            rebuildLimitedProcessItems()
+            updateCPUProcesses(
+                cpuProcessItems.compactMap { ($0.representedObject as? ProcessMenuSelection)?.process }
+            )
+        }
+    }
+
+    @objc private func enforceProcessLimits() {
+        var shouldRefreshMenu = false
+        let now = Date()
+
+        for pid in Array(limitedProcessOrder) {
+            guard var process = limitedProcesses[pid] else {
+                continue
+            }
+
+            guard ProcessLimiter.processExists(pid: pid) else {
+                removeProcessLimit(pid: pid, shouldResetPolicy: false, shouldRefreshMenu: false)
+                shouldRefreshMenu = true
+                continue
+            }
+
+            guard case .throttle(let allowedCPU) = process.mode else {
+                continue
+            }
+
+            let period: TimeInterval = 1
+            let runDuration = period * min(1, max(0.05, allowedCPU))
+            let phase = now.timeIntervalSince(process.modeStartedAt)
+                .truncatingRemainder(dividingBy: period)
+            let shouldRun = phase < runDuration
+
+            guard shouldRun != process.isRunning else {
+                continue
+            }
+
+            let didSendSignal = shouldRun
+                ? ProcessLimiter.resume(pid: pid)
+                : ProcessLimiter.suspend(pid: pid)
+
+            if didSendSignal {
+                process.isRunning = shouldRun
+                limitedProcesses[pid] = process
+            } else {
+                removeProcessLimit(pid: pid, shouldResetPolicy: false, shouldRefreshMenu: false)
+                shouldRefreshMenu = true
+            }
+        }
+
+        if shouldRefreshMenu {
+            rebuildLimitedProcessItems()
+            updateCPUProcesses(
+                cpuProcessItems.compactMap { ($0.representedObject as? ProcessMenuSelection)?.process }
+            )
+        }
+    }
+
+    private func updateProcessLimitTimer() {
+        let needsTimer = limitedProcesses.values.contains {
+            if case .throttle = $0.mode {
+                return true
+            }
+            return false
+        }
+
+        if needsTimer, processLimitTimer == nil {
+            processLimitTimer = Timer.scheduledTimer(
+                timeInterval: 0.25,
+                target: self,
+                selector: #selector(enforceProcessLimits),
+                userInfo: nil,
+                repeats: true
+            )
+            if let processLimitTimer {
+                RunLoop.main.add(processLimitTimer, forMode: .common)
+            }
+        } else if !needsTimer {
+            processLimitTimer?.invalidate()
+            processLimitTimer = nil
+        }
+    }
+
+    private func rebuildLimitedProcessItems() {
+        limitedProcessMenuItems.forEach { menu.removeItem($0) }
+        limitedProcessMenuItems.removeAll()
+        noLimitedProcessesItem.isHidden = !limitedProcesses.isEmpty
+
+        guard let insertionIndex = menu.items.firstIndex(where: { $0 === controlsSeparatorItem }) else {
+            return
+        }
+
+        for pid in limitedProcessOrder {
+            guard let process = limitedProcesses[pid] else {
+                continue
+            }
+
+            let item = NSMenuItem(
+                title: "\(process.name) (\(process.pid)): \(process.mode.title)",
+                action: nil,
+                keyEquivalent: ""
+            )
+            item.submenu = makeProcessLimitSubmenu(for: process)
+            menu.insertItem(item, at: insertionIndex + limitedProcessMenuItems.count)
+            limitedProcessMenuItems.append(item)
+        }
+    }
+
+    private func makeProcessLimitSubmenu(for process: LimitedProcess) -> NSMenu {
+        let submenu = NSMenu()
+        let modes: [ProcessLimitMode] = [
+            .background,
+            .throttle(0.75),
+            .throttle(0.50),
+            .throttle(0.25)
+        ]
+
+        for mode in modes {
+            let item = NSMenuItem(
+                title: mode.title,
+                action: #selector(changeProcessLimitMode(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = ProcessLimitMenuSelection(pid: process.pid, mode: mode)
+            item.state = process.mode == mode ? .on : .off
+            submenu.addItem(item)
+        }
+
+        submenu.addItem(NSMenuItem.separator())
+
+        let removeItem = NSMenuItem(
+            title: "Remove Limit",
+            action: #selector(removeProcessLimit(_:)),
+            keyEquivalent: ""
+        )
+        removeItem.target = self
+        removeItem.representedObject = ProcessLimitMenuSelection(pid: process.pid, mode: nil)
+        submenu.addItem(removeItem)
+
+        return submenu
+    }
+
     private func configureMenu() {
         menu.delegate = self
 
@@ -1030,6 +1437,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(cpuProcessesSeparatorItem)
         menu.addItem(topCPUProcessesTitleItem)
         cpuProcessItems.forEach { menu.addItem($0) }
+
+        menu.addItem(limitedProcessesSeparatorItem)
+        menu.addItem(limitedProcessesTitleItem)
+        menu.addItem(noLimitedProcessesItem)
 
         menu.addItem(controlsSeparatorItem)
 
