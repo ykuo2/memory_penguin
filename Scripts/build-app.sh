@@ -5,15 +5,27 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_DIR="$ROOT_DIR/dist/MemoryPenguin.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 ICONSET_DIR="$ROOT_DIR/.build/AppIcon.iconset"
+INFO_PLIST="$ROOT_DIR/Resources/Info.plist"
 BUILD_NUMBER="$(date +%Y%m%d%H%M)"
 
 cd "$ROOT_DIR"
+CURRENT_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$INFO_PLIST")"
+IFS='.' read -r VERSION_MAJOR VERSION_MINOR VERSION_PATCH <<< "$CURRENT_VERSION"
+VERSION_MAJOR="${VERSION_MAJOR:-0}"
+VERSION_MINOR="${VERSION_MINOR:-0}"
+VERSION_PATCH="${VERSION_PATCH:-0}"
+if [[ ! "$VERSION_PATCH" =~ ^[0-9]+$ ]]; then
+    VERSION_PATCH=0
+fi
+SHORT_VERSION="$VERSION_MAJOR.$VERSION_MINOR.$((VERSION_PATCH + 1))"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $SHORT_VERSION" "$INFO_PLIST"
+
 swift build -c release
 
 rm -rf "$APP_DIR"
 mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
 cp "$ROOT_DIR/.build/release/MemoryPenguin" "$CONTENTS_DIR/MacOS/MemoryPenguin"
-cp "$ROOT_DIR/Resources/Info.plist" "$CONTENTS_DIR/Info.plist"
+cp "$INFO_PLIST" "$CONTENTS_DIR/Info.plist"
 plutil -replace CFBundleVersion -string "$BUILD_NUMBER" "$CONTENTS_DIR/Info.plist"
 cp "$ROOT_DIR/Resources/icon.png" "$CONTENTS_DIR/Resources/icon.png"
 cp "$ROOT_DIR/Resources/memory_icon.png" "$CONTENTS_DIR/Resources/memory_icon.png"
@@ -35,4 +47,4 @@ iconutil -c icns "$ICONSET_DIR" -o "$CONTENTS_DIR/Resources/AppIcon.icns"
 xattr -cr "$APP_DIR"
 codesign --force --deep --sign - "$APP_DIR" >/dev/null
 
-echo "Built $APP_DIR (build $BUILD_NUMBER)"
+echo "Built $APP_DIR (version $SHORT_VERSION, build $BUILD_NUMBER)"

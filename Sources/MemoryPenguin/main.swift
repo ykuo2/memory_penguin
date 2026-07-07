@@ -25,6 +25,12 @@ struct ProcessMemorySnapshot: Sendable {
     let pid: Int
     let name: String
     let memory: UInt64
+    let cpu: Double
+}
+
+struct ProcessSnapshot: Sendable {
+    let topMemoryProcesses: [ProcessMemorySnapshot]
+    let topCPUProcesses: [ProcessMemorySnapshot]
 }
 
 struct SwapSnapshot {
@@ -229,10 +235,35 @@ enum MemoryReader {
 }
 
 enum ProcessMemoryReader {
-    static func top(limit: Int = 6) -> [ProcessMemorySnapshot] {
+    static func snapshot(memoryLimit: Int = 5, cpuLimit: Int = 5) -> ProcessSnapshot {
+        let processes = readProcesses().filter { !isExcluded($0) }
+        let topMemoryProcesses = processes
+            .sorted {
+                if $0.memory == $1.memory {
+                    return $0.cpu > $1.cpu
+                }
+                return $0.memory > $1.memory
+            }
+            .prefix(memoryLimit)
+        let topCPUProcesses = processes
+            .sorted {
+                if $0.cpu == $1.cpu {
+                    return $0.memory > $1.memory
+                }
+                return $0.cpu > $1.cpu
+            }
+            .prefix(cpuLimit)
+
+        return ProcessSnapshot(
+            topMemoryProcesses: Array(topMemoryProcesses),
+            topCPUProcesses: Array(topCPUProcesses)
+        )
+    }
+
+    private static func readProcesses() -> [ProcessMemorySnapshot] {
         let task = Foundation.Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/top")
-        task.arguments = ["-l", "1", "-o", "mem", "-n", "\(limit)", "-stats", "pid,command,mem"]
+        task.executableURL = URL(fileURLWithPath: "/bin/ps")
+        task.arguments = ["-axo", "pid=,rss=,pcpu=,comm="]
 
         let outputPipe = Pipe()
         let errorPipe = Pipe()
@@ -262,32 +293,29 @@ enum ProcessMemoryReader {
             processes.append(process)
         }
 
-        return Array(processes.sorted { $0.memory > $1.memory }.prefix(limit))
+        return processes
     }
 
     private static func parse(_ raw: String) -> ProcessMemorySnapshot? {
         let trimmed = raw.trimmingCharacters(in: .whitespaces)
-        guard let pidMatch = trimmed.range(of: #"^\d+\*?"#, options: .regularExpression) else {
+        let parts = trimmed.split(maxSplits: 3, omittingEmptySubsequences: true) { $0.isWhitespace }
+        guard parts.count == 4,
+              let pid = Int(parts[0]),
+              let residentKilobytes = UInt64(parts[1]),
+              let cpu = Double(parts[2]) else {
             return nil
         }
 
-        let pidString = trimmed[pidMatch].filter(\.isNumber)
-        guard let pid = Int(pidString) else {
-            return nil
-        }
+        let command = String(parts[3])
+        let fallback = (command as NSString).lastPathComponent
+        let name = processName(pid: pid, fallback: fallback.isEmpty ? "Process \(pid)" : fallback)
 
-        let remainder = trimmed[pidMatch.upperBound...].trimmingCharacters(in: .whitespaces)
-        guard let memoryMatch = remainder.range(of: #"[0-9]+(\.[0-9]+)?[KMGTP]?[+\-]?$"#, options: .regularExpression) else {
-            return nil
-        }
-
-        let memoryString = String(remainder[memoryMatch])
-        let command = remainder[..<memoryMatch.lowerBound]
-            .trimmingCharacters(in: .whitespaces)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "+-"))
-        let name = processName(pid: pid, fallback: command.isEmpty ? "Process \(pid)" : command)
-
-        return ProcessMemorySnapshot(pid: pid, name: name, memory: parseMemory(memoryString))
+        return ProcessMemorySnapshot(
+            pid: pid,
+            name: name,
+            memory: residentKilobytes * 1024,
+            cpu: cpu
+        )
     }
 
     private static func processName(pid: Int, fallback: String) -> String {
@@ -297,27 +325,15 @@ enum ProcessMemoryReader {
         return fallback
     }
 
-    private static func parseMemory(_ raw: String) -> UInt64 {
-        let normalized = raw.trimmingCharacters(in: CharacterSet(charactersIn: "+-"))
-        let numberPart = normalized.filter { $0.isNumber || $0 == "." }
-        let unit = normalized.last?.uppercased() ?? ""
-        let value = Double(numberPart) ?? 0
+    private static func isExcluded(_ process: ProcessMemorySnapshot) -> Bool {
+        let normalizedName = process.name
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: " ", with: "")
 
-        let multiplier: Double
-        switch unit {
-        case "T":
-            multiplier = 1024 * 1024 * 1024 * 1024
-        case "G":
-            multiplier = 1024 * 1024 * 1024
-        case "M":
-            multiplier = 1024 * 1024
-        case "K":
-            multiplier = 1024
-        default:
-            multiplier = 1
-        }
-
-        return UInt64(max(0, value * multiplier))
+        return normalizedName == "windowserver"
+            || normalizedName == "kerneltask"
+            || normalizedName == "kernel"
     }
 }
 
@@ -339,6 +355,13 @@ enum ByteFormatter {
     static func rate(_ bytesPerSecond: Double) -> String {
         let rounded = max(0, Int64(bytesPerSecond.rounded()))
         return "\(formatter.string(fromByteCount: rounded))/s"
+    }
+
+    static func percent(_ value: Double) -> String {
+        if value >= 100 {
+            return String(format: "%.0f%%", value)
+        }
+        return String(format: "%.1f%%", value)
     }
 }
 
@@ -711,6 +734,7 @@ enum LoginItemController {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private enum DefaultsKey {
         static let showsPercentage = "showsPercentage"
+        static let showsDetailedMemoryInfo = "showsDetailedMemoryInfo"
     }
 
     private enum RefreshInterval {
@@ -740,11 +764,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let swapUsedItem = AppDelegate.makeDisabledItem()
     private let swapAvailableItem = AppDelegate.makeDisabledItem()
     private let swapTotalItem = AppDelegate.makeDisabledItem()
-    private let topProcessesTitleItem = AppDelegate.makeDisabledItem("Top Processes")
+    private let overviewSeparatorItem = NSMenuItem.separator()
+    private let stateSeparatorItem = NSMenuItem.separator()
+    private let activitySeparatorItem = NSMenuItem.separator()
+    private let processesSeparatorItem = NSMenuItem.separator()
+    private let cpuProcessesSeparatorItem = NSMenuItem.separator()
+    private let controlsSeparatorItem = NSMenuItem.separator()
+    private let topProcessesTitleItem = AppDelegate.makeDisabledItem("Top Memory Processes")
     private let processItems = (0..<5).map { _ in AppDelegate.makeDisabledItem() }
+    private let topCPUProcessesTitleItem = AppDelegate.makeDisabledItem("Top CPU Processes")
+    private let cpuProcessItems = (0..<5).map { _ in AppDelegate.makeDisabledItem() }
     private let togglePercentageItem = NSMenuItem(
         title: "Show Percentage",
         action: #selector(togglePercentageVisibility),
+        keyEquivalent: ""
+    )
+    private let toggleDetailedMemoryItem = NSMenuItem(
+        title: "Show Detailed Memory Info",
+        action: #selector(toggleDetailedMemoryInfo),
         keyEquivalent: ""
     )
     private let launchAtLoginItem = NSMenuItem(
@@ -777,6 +814,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set {
             UserDefaults.standard.set(newValue, forKey: DefaultsKey.showsPercentage)
         }
+    }
+    private var showsDetailedMemoryInfo: Bool {
+        get {
+            guard UserDefaults.standard.object(forKey: DefaultsKey.showsDetailedMemoryInfo) != nil else {
+                return true
+            }
+            return UserDefaults.standard.bool(forKey: DefaultsKey.showsDetailedMemoryInfo)
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: DefaultsKey.showsDetailedMemoryInfo)
+        }
+    }
+    private var detailedMemoryItems: [NSMenuItem] {
+        [
+            overviewSeparatorItem,
+            totalItem,
+            usedItem,
+            availableItem,
+            appMemoryItem,
+            cacheItem,
+            fileBackedItem,
+            anonymousItem,
+            stateSeparatorItem,
+            freeItem,
+            activeItem,
+            inactiveItem,
+            wiredItem,
+            compressedItem,
+            purgeableItem,
+            speculativeItem,
+            activitySeparatorItem,
+            pageOutRateItem,
+            swapTrafficRateItem,
+            swapUsedItem,
+            swapAvailableItem,
+            swapTotalItem
+        ]
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -847,11 +921,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         togglePercentageItem.state = showsPercentage ? .on : .off
+        toggleDetailedMemoryItem.state = showsDetailedMemoryInfo ? .on : .off
+        applyDetailedMemoryVisibility()
         updateLaunchAtLoginItem()
     }
 
-    private func updateProcesses(_ processes: [ProcessMemorySnapshot]) {
+    private func updateProcesses(_ snapshot: ProcessSnapshot) {
         hasProcessSnapshot = true
+        updateMemoryProcesses(snapshot.topMemoryProcesses)
+        updateCPUProcesses(snapshot.topCPUProcesses)
+    }
+
+    private func updateMemoryProcesses(_ processes: [ProcessMemorySnapshot]) {
         for index in processItems.indices {
             if index < processes.count {
                 let process = processes[index]
@@ -860,6 +941,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 processItems[index].title = "\(index + 1). --"
             }
         }
+    }
+
+    private func updateCPUProcesses(_ processes: [ProcessMemorySnapshot]) {
+        for index in cpuProcessItems.indices {
+            if index < processes.count {
+                let process = processes[index]
+                cpuProcessItems[index].title = "\(index + 1). \(process.name): \(ByteFormatter.percent(process.cpu))"
+            } else {
+                cpuProcessItems[index].title = "\(index + 1). --"
+            }
+        }
+    }
+
+    private func applyDetailedMemoryVisibility() {
+        let shouldHide = !showsDetailedMemoryInfo
+        detailedMemoryItems.forEach { $0.isHidden = shouldHide }
     }
 
     private func requestProcessRefresh() {
@@ -873,25 +970,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if !hasProcessSnapshot {
             processItems.first?.title = "Loading..."
+            cpuProcessItems.first?.title = "Loading..."
         }
 
         processQueue.async { [weak self] in
-            let processes = ProcessMemoryReader.top(limit: 5)
+            let snapshot = ProcessMemoryReader.snapshot(memoryLimit: 5, cpuLimit: 5)
 
             Task { @MainActor [weak self] in
-                self?.finishProcessRefresh(processes, generation: generation)
+                self?.finishProcessRefresh(snapshot, generation: generation)
             }
         }
     }
 
-    private func finishProcessRefresh(_ processes: [ProcessMemorySnapshot], generation: Int) {
+    private func finishProcessRefresh(_ snapshot: ProcessSnapshot, generation: Int) {
         isProcessRefreshInFlight = false
 
         guard isMenuOpen, generation == processRefreshGeneration else {
             return
         }
 
-        updateProcesses(processes)
+        updateProcesses(snapshot)
     }
 
     private func configureMenu() {
@@ -899,7 +997,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         for item in [
             summaryItem,
-            NSMenuItem.separator(),
+            overviewSeparatorItem,
             totalItem,
             usedItem,
             availableItem,
@@ -907,7 +1005,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             cacheItem,
             fileBackedItem,
             anonymousItem,
-            NSMenuItem.separator(),
+            stateSeparatorItem,
             freeItem,
             activeItem,
             inactiveItem,
@@ -915,13 +1013,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             compressedItem,
             purgeableItem,
             speculativeItem,
-            NSMenuItem.separator(),
+            activitySeparatorItem,
             pageOutRateItem,
             swapTrafficRateItem,
             swapUsedItem,
             swapAvailableItem,
             swapTotalItem,
-            NSMenuItem.separator(),
+            processesSeparatorItem,
             topProcessesTitleItem
         ] {
             menu.addItem(item)
@@ -929,10 +1027,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         processItems.forEach { menu.addItem($0) }
 
-        menu.addItem(NSMenuItem.separator())
+        menu.addItem(cpuProcessesSeparatorItem)
+        menu.addItem(topCPUProcessesTitleItem)
+        cpuProcessItems.forEach { menu.addItem($0) }
+
+        menu.addItem(controlsSeparatorItem)
 
         togglePercentageItem.target = self
         menu.addItem(togglePercentageItem)
+
+        toggleDetailedMemoryItem.target = self
+        menu.addItem(toggleDetailedMemoryItem)
+        applyDetailedMemoryVisibility()
 
         launchAtLoginItem.target = self
         menu.addItem(launchAtLoginItem)
@@ -1000,6 +1106,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             updateStatusItem(with: latestSnapshot)
             updateMenu(with: latestSnapshot)
         }
+    }
+
+    @objc private func toggleDetailedMemoryInfo() {
+        showsDetailedMemoryInfo.toggle()
+        toggleDetailedMemoryItem.state = showsDetailedMemoryInfo ? .on : .off
+        applyDetailedMemoryVisibility()
     }
 
     private func updateLaunchAtLoginItem() {

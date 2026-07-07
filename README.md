@@ -16,7 +16,8 @@ This project uses Swift + AppKit because it is the best fit for a lightweight ma
 - Updates lightweight menu bar memory data every 2 seconds, then every second while the menu is open.
 - Shows or hides the percentage in the menu bar with the `Show Percentage` menu item.
 - Enables or disables opening at login with the `Launch at Login` menu item.
-- Displays total, used, available, app memory, cache, file-backed cache, anonymous, free, active, inactive, wired, compressed, purgeable, speculative, page-out rate, swap traffic rate, swap memory values, and the five processes using the most memory.
+- Displays total, used, available, app memory, cache, file-backed cache, anonymous, free, active, inactive, wired, compressed, purgeable, speculative, page-out rate, swap traffic rate, swap memory values, plus separate top memory and top CPU process lists.
+- Shows or hides detailed memory sections with the `Show Detailed Memory Info` menu item.
 - Uses three minimalist Adelie-inspired icon states:
   - Green short mark: calm pressure.
   - Yellow medium mark: elevated pressure.
@@ -39,9 +40,9 @@ The menu bar percentage is memory usage, not a private Activity Monitor pressure
 
 ## Resource Use
 
-Memory counters and pressure state are read through macOS VM and sysctl APIs, not through `top`. The app uses `/usr/bin/top` only for the `Top Processes` list.
+Memory counters and pressure state are read through macOS VM and sysctl APIs. Process lists are read from a lightweight `ps` snapshot, then sorted in the app.
 
-When the menu is closed, Memory Penguin refreshes lightweight status data every 2 seconds and does not run `top`. When the menu is open, it refreshes every second and starts `top` in the background to update the five visible processes without blocking the menu.
+When the menu is closed, Memory Penguin refreshes lightweight status data every 2 seconds and does not read the process list. When the menu is open, it refreshes every second and reads process data in the background to update the five visible memory processes and five visible CPU processes without blocking the menu.
 
 ## Build
 
@@ -72,4 +73,4 @@ For regular use, prefer the `.app` bundle so `LSUIElement` is applied and the ap
 
 For `Launch at Login`, move `dist/MemoryPenguin.app` into `/Applications` first. The build script ad-hoc signs the local bundle so macOS can register it as a login item.
 
-Each release build automatically updates `CFBundleVersion` to a timestamp build number.
+Each release build automatically increments the patch component of `CFBundleShortVersionString` and updates `CFBundleVersion` to a timestamp build number.
