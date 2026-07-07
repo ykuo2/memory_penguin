@@ -20,10 +20,23 @@ Memory Penguin is inspired by [Stats](https://github.com/exelban/stats), a macOS
 
 ## Icon States
 
-| Calm | Elevated | High |
-| --- | --- | --- |
-| <img src="Resources/Generated/memory_preview_calm.png" alt="Calm memory pressure icon" width="96"> | <img src="Resources/Generated/memory_preview_elevated.png" alt="Elevated memory pressure icon" width="96"> | <img src="Resources/Generated/memory_preview_high.png" alt="High memory pressure icon" width="96"> |
-| Normal memory pressure | Elevated memory pressure | High memory pressure |
+<table>
+  <tr>
+    <th align="center">Calm</th>
+    <th align="center">Elevated</th>
+    <th align="center">High</th>
+  </tr>
+  <tr>
+    <td align="center"><img src="Resources/Generated/memory_preview_calm.png" alt="Calm memory pressure icon" width="96"></td>
+    <td align="center"><img src="Resources/Generated/memory_preview_elevated.png" alt="Elevated memory pressure icon" width="96"></td>
+    <td align="center"><img src="Resources/Generated/memory_preview_high.png" alt="High memory pressure icon" width="96"></td>
+  </tr>
+  <tr>
+    <td align="center">Normal memory pressure</td>
+    <td align="center">Elevated memory pressure</td>
+    <td align="center">High memory pressure</td>
+  </tr>
+</table>
 
 ## Features
 
