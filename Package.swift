@@ -8,9 +8,20 @@ let package = Package(
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "MemoryPenguin", targets: ["MemoryPenguin"])
+        .library(name: "MemoryPenguinCore", targets: ["MemoryPenguinCore"]),
+        .executable(name: "MemoryPenguin", targets: ["MemoryPenguin"]),
+        .executable(name: "MemoryPenguinCoreSelfTests", targets: ["MemoryPenguinCoreSelfTests"])
     ],
     targets: [
-        .executableTarget(name: "MemoryPenguin")
+        .target(name: "MemoryPenguinCore"),
+        .executableTarget(
+            name: "MemoryPenguin",
+            dependencies: ["MemoryPenguinCore"]
+        ),
+        .executableTarget(
+            name: "MemoryPenguinCoreSelfTests",
+            dependencies: ["MemoryPenguinCore"],
+            path: "Tests/MemoryPenguinCoreSelfTests"
+        )
     ]
 )

@@ -141,6 +141,16 @@ open dist/MemoryPenguin.app
 
 For each intentional release or user-facing change, update `CFBundleShortVersionString` in `Resources/Info.plist`. `Scripts/build-app.sh` reads that version and updates the bundled `CFBundleVersion` to a timestamp build number.
 
+## Tests
+
+Run the core self-tests from the project root:
+
+```bash
+swift run MemoryPenguinCoreSelfTests
+```
+
+The self-test executable verifies the reusable core logic without launching the menu bar app. It covers derived memory calculations, activity rate calculations, memory pressure mapping, `ps` output parsing, process sorting and filtering, and CPU limit mode labels.
+
 ## CPU Limiting
 
 CPU limiting is session-based and applies only to the selected PID. When the process exits, the limit disappears.
@@ -216,13 +226,15 @@ Current usage model:
 ## Project Structure
 
 ```text
-Sources/MemoryPenguin/main.swift       App source code
-Resources/Info.plist                   macOS app bundle metadata
-Resources/icon.png                     App icon
-Resources/memory_icon.png              Menu bar icon sheet
-Scripts/build-app.sh                   Build app bundle
-Scripts/CPUStressTest.swift            CPU stress test utility
-Scripts/generate-icon-previews.swift   Icon preview generator
+Sources/MemoryPenguin/main.swift              App menu, status item, and UI wiring
+Sources/MemoryPenguinCore/                    Reusable memory/process/core logic
+Tests/MemoryPenguinCoreSelfTests/main.swift   Core self-test executable
+Resources/Info.plist                          macOS app bundle metadata
+Resources/icon.png                            App icon
+Resources/memory_icon.png                     Menu bar icon sheet
+Scripts/build-app.sh                          Build app bundle
+Scripts/CPUStressTest.swift                   CPU stress test utility
+Scripts/generate-icon-previews.swift          Icon preview generator
 ```
 
 ## License
