@@ -31,283 +31,32 @@ enum PenguinIconFactory {
             return cached
         }
 
-        let icon = loadSpriteIcon(for: level) ?? fallbackIcon(for: level)
+        let icon = loadStatusIcon(for: level) ?? fallbackIcon(for: level)
         cachedIcons[level] = icon
         return icon
     }
 
-    private static func loadSpriteIcon(for level: MemoryPressureLevel) -> NSImage? {
-        guard let source = loadMemoryIconSheet(),
-              let cgImage = source.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            return nil
-        }
-
-        let index: Int
+    private static func loadStatusIcon(for level: MemoryPressureLevel) -> NSImage? {
+        let resourceName: String
         switch level {
         case .calm:
-            index = 0
+            resourceName = "memory_status_calm"
         case .warm:
-            index = 1
+            resourceName = "memory_status_elevated"
         case .hot:
-            index = 2
+            resourceName = "memory_status_high"
         }
 
-        let segmentWidth = cgImage.width / 3
-        let cropRect = CGRect(x: segmentWidth * index, y: 0, width: segmentWidth, height: cgImage.height)
-        guard let cropped = cgImage.cropping(to: cropRect) else {
+        let bundledURL = Bundle.main.url(forResource: resourceName, withExtension: "png")
+        let developmentURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("Resources/Generated/StatusIcons/\(resourceName).png")
+        guard let image = NSImage(contentsOf: bundledURL ?? developmentURL) else {
             return nil
         }
 
-        let transparent = removeEdgeBackground(from: cropped) ?? cropped
-        let content = cropToVisibleContent(transparent) ?? transparent
-        let targetSize = NSSize(width: 24, height: 22)
-        let image = NSImage(size: targetSize)
-        image.lockFocus()
-        defer { image.unlockFocus() }
-
-        NSGraphicsContext.current?.imageInterpolation = .high
-
-        let contentSize = NSSize(width: content.width, height: content.height)
-        let drawRect = aspectFitRect(contentSize: contentSize, container: NSRect(origin: .zero, size: targetSize))
-        NSImage(cgImage: content, size: contentSize).draw(
-            in: drawRect,
-            from: .zero,
-            operation: .sourceOver,
-            fraction: 1
-        )
+        image.size = NSSize(width: 24, height: 22)
         image.isTemplate = false
         return image
-    }
-
-    private static func removeEdgeBackground(from image: CGImage) -> CGImage? {
-        let width = image.width
-        let height = image.height
-        let bytesPerPixel = 4
-        let bytesPerRow = width * bytesPerPixel
-        var pixels = [UInt8](repeating: 0, count: height * bytesPerRow)
-
-        guard let context = CGContext(
-            data: &pixels,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: bytesPerRow,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
-            return nil
-        }
-
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-
-        let protected = protectedForegroundMask(pixels: pixels, width: width, height: height, bytesPerPixel: bytesPerPixel)
-        var queue: [(Int, Int)] = []
-        var visited = [Bool](repeating: false, count: width * height)
-
-        func offset(_ x: Int, _ y: Int) -> Int {
-            (y * width + x) * bytesPerPixel
-        }
-
-        func isBackground(_ x: Int, _ y: Int) -> Bool {
-            let visitIndex = y * width + x
-            guard !protected[visitIndex] else {
-                return false
-            }
-
-            let idx = offset(x, y)
-            let red = Int(pixels[idx])
-            let green = Int(pixels[idx + 1])
-            let blue = Int(pixels[idx + 2])
-            return max(red, green, blue) < 34
-        }
-
-        func enqueue(_ x: Int, _ y: Int) {
-            guard x >= 0, x < width, y >= 0, y < height else {
-                return
-            }
-
-            let visitIndex = y * width + x
-            guard !visited[visitIndex], isBackground(x, y) else {
-                return
-            }
-
-            visited[visitIndex] = true
-            queue.append((x, y))
-        }
-
-        for x in 0..<width {
-            enqueue(x, 0)
-            enqueue(x, height - 1)
-        }
-        for y in 0..<height {
-            enqueue(0, y)
-            enqueue(width - 1, y)
-        }
-
-        var cursor = 0
-        while cursor < queue.count {
-            let (x, y) = queue[cursor]
-            cursor += 1
-
-            let idx = offset(x, y)
-            pixels[idx + 3] = 0
-
-            enqueue(x + 1, y)
-            enqueue(x - 1, y)
-            enqueue(x, y + 1)
-            enqueue(x, y - 1)
-        }
-
-        guard let outputContext = CGContext(
-            data: &pixels,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: bytesPerRow,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
-            return nil
-        }
-
-        return outputContext.makeImage()
-    }
-
-    private static func protectedForegroundMask(
-        pixels: [UInt8],
-        width: Int,
-        height: Int,
-        bytesPerPixel: Int
-    ) -> [Bool] {
-        let radius = 2
-        var seed = [Bool](repeating: false, count: width * height)
-
-        for y in 0..<height {
-            for x in 0..<width {
-                let idx = (y * width + x) * bytesPerPixel
-                let red = Int(pixels[idx])
-                let green = Int(pixels[idx + 1])
-                let blue = Int(pixels[idx + 2])
-                let brightest = max(red, green, blue)
-                let darkest = min(red, green, blue)
-                seed[y * width + x] = brightest > 46 || (brightest > 34 && brightest - darkest > 18)
-            }
-        }
-
-        var horizontal = [Bool](repeating: false, count: width * height)
-        for y in 0..<height {
-            var count = 0
-            for x in 0..<width {
-                let entering = x + radius
-                let leaving = x - radius - 1
-                if entering < width, seed[y * width + entering] {
-                    count += 1
-                }
-                if leaving >= 0, seed[y * width + leaving] {
-                    count -= 1
-                }
-                horizontal[y * width + x] = count > 0
-            }
-        }
-
-        var protected = [Bool](repeating: false, count: width * height)
-        for x in 0..<width {
-            var count = 0
-            for y in 0..<height {
-                let entering = y + radius
-                let leaving = y - radius - 1
-                if entering < height, horizontal[entering * width + x] {
-                    count += 1
-                }
-                if leaving >= 0, horizontal[leaving * width + x] {
-                    count -= 1
-                }
-                protected[y * width + x] = count > 0
-            }
-        }
-
-        return protected
-    }
-
-    private static func cropToVisibleContent(_ image: CGImage) -> CGImage? {
-        let width = image.width
-        let height = image.height
-        let bytesPerPixel = 4
-        let bytesPerRow = width * bytesPerPixel
-        var pixels = [UInt8](repeating: 0, count: height * bytesPerRow)
-
-        guard let context = CGContext(
-            data: &pixels,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: bytesPerRow,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
-            return nil
-        }
-
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-
-        var minX = width
-        var minY = height
-        var maxX = 0
-        var maxY = 0
-        var foundPixel = false
-
-        for y in 0..<height {
-            for x in 0..<width {
-                let alpha = pixels[(y * width + x) * bytesPerPixel + 3]
-                guard alpha > 8 else {
-                    continue
-                }
-
-                foundPixel = true
-                minX = min(minX, x)
-                minY = min(minY, y)
-                maxX = max(maxX, x)
-                maxY = max(maxY, y)
-            }
-        }
-
-        guard foundPixel else {
-            return nil
-        }
-
-        let padding = 10
-        let cropX = max(0, minX - padding)
-        let cropY = max(0, minY - padding)
-        let cropMaxX = min(width - 1, maxX + padding)
-        let cropMaxY = min(height - 1, maxY + padding)
-        let cropRect = CGRect(x: cropX, y: cropY, width: cropMaxX - cropX + 1, height: cropMaxY - cropY + 1)
-        return image.cropping(to: cropRect)
-    }
-
-    private static func aspectFitRect(contentSize: NSSize, container: NSRect) -> NSRect {
-        guard contentSize.width > 0, contentSize.height > 0 else {
-            return container
-        }
-
-        let scale = min(container.width / contentSize.width, container.height / contentSize.height)
-        let width = contentSize.width * scale
-        let height = contentSize.height * scale
-        return NSRect(
-            x: container.minX + (container.width - width) / 2,
-            y: container.minY + (container.height - height) / 2,
-            width: width,
-            height: height
-        )
-    }
-
-    private static func loadMemoryIconSheet() -> NSImage? {
-        if let url = Bundle.main.url(forResource: "memory_icon", withExtension: "png") {
-            return NSImage(contentsOf: url)
-        }
-
-        let developmentURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appendingPathComponent("Resources/memory_icon.png")
-        return NSImage(contentsOf: developmentURL)
     }
 
     private static func fallbackIcon(for level: MemoryPressureLevel) -> NSImage {

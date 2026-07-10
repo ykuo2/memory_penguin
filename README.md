@@ -38,6 +38,8 @@ Memory Penguin is inspired by [Stats](https://github.com/exelban/stats), a macOS
   </tr>
 </table>
 
+The menu bar uses three pre-generated 48 x 44 transparent PNG assets. The app loads and caches the matching asset for each pressure state; it no longer crops or removes the sprite-sheet background at runtime. The original `Resources/memory_icon.png` sprite sheet remains in the repository and app bundle as the source artwork.
+
 ## Features
 
 - Shows current memory usage percentage and memory pressure state in the menu bar.
@@ -97,11 +99,14 @@ chmod +x Scripts/build-app.sh
 Scripts/build-app.sh
 ```
 
-The app bundle will be created at:
+The app bundle and portable archive will be created at:
 
 ```text
 dist/MemoryPenguin.app
+dist/MemoryPenguin.zip
 ```
+
+The archive is created from the clean signed staging bundle and independently extracted and verified by the build script. This prevents Desktop file-provider metadata from being stored inside the distributable app.
 
 Run the app:
 
@@ -140,6 +145,14 @@ open dist/MemoryPenguin.app
 ```
 
 For each intentional release or user-facing change, update `CFBundleShortVersionString` in `Resources/Info.plist`. `Scripts/build-app.sh` reads that version and updates the bundled `CFBundleVersion` to a timestamp build number.
+
+Regenerate the transparent status icons and README previews after changing the source sprite sheet:
+
+```bash
+swift Scripts/generate-icon-previews.swift
+```
+
+On macOS 14 or later, the generator uses the system Vision foreground mask to preserve the black penguin while removing the dark background.
 
 ## Tests
 
@@ -231,10 +244,11 @@ Sources/MemoryPenguinCore/                    Reusable memory/process/core logic
 Tests/MemoryPenguinCoreSelfTests/main.swift   Core self-test executable
 Resources/Info.plist                          macOS app bundle metadata
 Resources/icon.png                            App icon
-Resources/memory_icon.png                     Menu bar icon sheet
+Resources/memory_icon.png                     Original menu bar sprite sheet
+Resources/Generated/StatusIcons/              Bundled transparent menu bar icons
 Scripts/build-app.sh                          Build app bundle
 Scripts/CPUStressTest.swift                   CPU stress test utility
-Scripts/generate-icon-previews.swift          Icon preview generator
+Scripts/generate-icon-previews.swift          Status icon and preview generator
 ```
 
 ## License
