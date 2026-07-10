@@ -41,40 +41,63 @@ public struct ProcessSnapshot: Sendable {
     }
 }
 
-public enum ProcessLimitMode: Equatable {
+public struct ProcessIdentity: Equatable, Sendable {
+    public let pid: Int
+    public let userID: UInt32
+    public let startTimeSeconds: UInt64
+    public let startTimeMicroseconds: UInt64
+
+    public init(
+        pid: Int,
+        userID: UInt32,
+        startTimeSeconds: UInt64,
+        startTimeMicroseconds: UInt64
+    ) {
+        self.pid = pid
+        self.userID = userID
+        self.startTimeSeconds = startTimeSeconds
+        self.startTimeMicroseconds = startTimeMicroseconds
+    }
+}
+
+public enum ProcessLimitMode: Equatable, Sendable {
     case background
-    case throttle(Double)
+    case dutyCycle(Double)
 
     public var title: String {
         switch self {
         case .background:
             return "Background Priority"
-        case .throttle(let allowedCPU):
-            return "Throttle to \(Int((allowedCPU * 100).rounded()))%"
+        case .dutyCycle(let runFraction):
+            return "Run \(Int((min(1, max(0.05, runFraction)) * 100).rounded()))% of Time"
         }
     }
 }
 
 public struct LimitedProcess {
-    public let pid: Int
+    public let identity: ProcessIdentity
     public let name: String
     public var mode: ProcessLimitMode
-    public var modeStartedAt: Date
+    public var modeStartedUptime: TimeInterval
     public var isRunning: Bool
     public var hasBackgroundPolicy: Bool
 
+    public var pid: Int {
+        identity.pid
+    }
+
     public init(
-        pid: Int,
+        identity: ProcessIdentity,
         name: String,
         mode: ProcessLimitMode,
-        modeStartedAt: Date,
+        modeStartedUptime: TimeInterval,
         isRunning: Bool,
         hasBackgroundPolicy: Bool
     ) {
-        self.pid = pid
+        self.identity = identity
         self.name = name
         self.mode = mode
-        self.modeStartedAt = modeStartedAt
+        self.modeStartedUptime = modeStartedUptime
         self.isRunning = isRunning
         self.hasBackgroundPolicy = hasBackgroundPolicy
     }
@@ -168,31 +191,57 @@ public struct MemorySnapshot {
         self.systemPressureLevel = systemPressureLevel
     }
 
+    public var physicalOccupied: UInt64 {
+        total - min(total, free)
+    }
+
+    public var nonFreeFileBackedEstimate: UInt64 {
+        fileBacked - min(fileBacked, speculative)
+    }
+
+    public var reclaimableEstimate: UInt64 {
+        let (combined, overflowed) = nonFreeFileBackedEstimate.addingReportingOverflow(purgeable)
+        return min(physicalOccupied, overflowed ? UInt64.max : combined)
+    }
+
+    public var effectiveUsedEstimate: UInt64 {
+        physicalOccupied - reclaimableEstimate
+    }
+
     public var appMemory: UInt64 {
-        let protectedMemory = wired + compressed
-        return used > protectedMemory ? used - protectedMemory : 0
+        min(anonymous, physicalOccupied)
     }
 
     public var cache: UInt64 {
-        purgeable + fileBacked
+        min(fileBacked, physicalOccupied)
     }
 
     public var used: UInt64 {
-        let rawUsed = active + inactive + speculative + wired + compressed
-        let reclaimable = purgeable + fileBacked
-        return rawUsed > reclaimable ? min(total, rawUsed - reclaimable) : 0
+        physicalOccupied
     }
 
     public var available: UInt64 {
-        total > used ? total - used : 0
+        min(total, free)
+    }
+
+    public var physicalUsageRatio: Double {
+        ratio(of: physicalOccupied)
+    }
+
+    public var effectiveUsageRatio: Double {
+        ratio(of: effectiveUsedEstimate)
     }
 
     public var usageRatio: Double {
+        physicalUsageRatio
+    }
+
+    private func ratio(of value: UInt64) -> Double {
         guard total > 0 else {
             return 0
         }
 
-        return min(1, max(0, Double(used) / Double(total)))
+        return min(1, max(0, Double(value) / Double(total)))
     }
 
     public var pressureLevel: MemoryPressureLevel {

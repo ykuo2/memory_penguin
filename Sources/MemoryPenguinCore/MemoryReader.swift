@@ -32,7 +32,7 @@ public enum MemoryReader {
         return MemorySnapshot(
             capturedAt: Date(),
             pageSize: multiplier,
-            total: readTotalPhysicalMemory(),
+            total: try readTotalPhysicalMemory(),
             free: UInt64(stats.free_count) * multiplier,
             active: UInt64(stats.active_count) * multiplier,
             inactive: UInt64(stats.inactive_count) * multiplier,
@@ -51,10 +51,17 @@ public enum MemoryReader {
         )
     }
 
-    private static func readTotalPhysicalMemory() -> UInt64 {
+    private static func readTotalPhysicalMemory() throws -> UInt64 {
         var total: UInt64 = 0
         var size = MemoryLayout<UInt64>.size
-        sysctlbyname("hw.memsize", &total, &size, nil, 0)
+        let result = sysctlbyname("hw.memsize", &total, &size, nil, 0)
+        guard result == 0, total > 0 else {
+            throw NSError(
+                domain: "MemoryPenguin",
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "Unable to read total physical memory."]
+            )
+        }
         return total
     }
 

@@ -41,42 +41,78 @@ private func require<T>(
 }
 
 private let tests: [TestCase] = [
-    TestCase(name: "derived memory values subtract reclaimable memory") {
+    TestCase(name: "effective used memory subtracts normalized reclaimable memory") {
         let snapshot = makeSnapshot(
             total: 1_000,
+            free: 100,
             active: 400,
             inactive: 300,
             wired: 200,
             compressed: 100,
             purgeable: 150,
             speculative: 100,
-            fileBacked: 50
+            fileBacked: 300,
+            anonymous: 600
         )
 
-        try expect(snapshot.used == 900, "expected used memory to subtract reclaimable memory")
-        try expect(snapshot.available == 100, "expected available memory to be total minus used")
-        try expect(snapshot.appMemory == 600, "expected app memory to exclude wired and compressed memory")
-        try expect(snapshot.cache == 200, "expected cache to combine purgeable and file-backed memory")
+        try expect(snapshot.physicalOccupied == 900, "expected occupied memory to be total minus free memory")
+        try expect(snapshot.used == snapshot.physicalOccupied, "expected used compatibility alias")
+        try expect(snapshot.available == 100, "expected available memory to equal capped kernel free memory")
+        try expect(snapshot.appMemory == 600, "expected bounded anonymous memory estimate")
+        try expect(snapshot.cache == 300, "expected bounded file-backed memory estimate")
+        try expect(snapshot.nonFreeFileBackedEstimate == 200, "expected speculative pages to be removed from file-backed estimate")
+        try expect(snapshot.reclaimableEstimate == 350, "expected reclaimable file-backed and purgeable memory")
+        try expect(snapshot.effectiveUsedEstimate == 550, "expected physical occupied memory to exclude reclaimable estimate")
+        try expect(abs(snapshot.physicalUsageRatio - 0.9) < 0.0001, "expected physical usage ratio to be 0.9")
+        try expect(abs(snapshot.effectiveUsageRatio - 0.55) < 0.0001, "expected effective usage ratio to be 0.55")
         try expect(abs(snapshot.usageRatio - 0.9) < 0.0001, "expected usage ratio to be 0.9")
     },
-    TestCase(name: "used memory is capped at total memory") {
+    TestCase(name: "effective used memory floors file-backed estimate after speculative removal") {
         let snapshot = makeSnapshot(
             total: 1_000,
-            active: 800,
-            inactive: 400,
-            wired: 200,
-            compressed: 100
+            free: 100,
+            purgeable: 150,
+            speculative: 500,
+            fileBacked: 200
         )
 
-        try expect(snapshot.used == 1_000, "expected used memory to be capped at total memory")
-        try expect(snapshot.available == 0, "expected available memory to floor at zero")
-        try expect(snapshot.usageRatio == 1.0, "expected usage ratio to cap at 1.0")
+        try expect(snapshot.nonFreeFileBackedEstimate == 0, "expected speculative subtraction to floor at zero")
+        try expect(snapshot.reclaimableEstimate == 150, "expected only purgeable memory to remain reclaimable")
+        try expect(snapshot.effectiveUsedEstimate == 750, "expected effective used memory after conservative reclaimable estimate")
+        try expect(abs(snapshot.effectiveUsageRatio - 0.75) < 0.0001, "expected effective usage ratio to be 0.75")
+    },
+    TestCase(name: "reclaimable estimate handles overflow and caps at physical occupied memory") {
+        let snapshot = makeSnapshot(
+            total: 1_000,
+            free: 100,
+            purgeable: 1,
+            fileBacked: UInt64.max
+        )
+
+        try expect(snapshot.reclaimableEstimate == 900, "expected reclaimable estimate to cap at occupied memory")
+        try expect(snapshot.effectiveUsedEstimate == 0, "expected effective used memory to floor at zero")
+        try expect(snapshot.effectiveUsageRatio == 0, "expected effective usage ratio to floor at zero")
+    },
+    TestCase(name: "kernel free memory is capped at total memory") {
+        let snapshot = makeSnapshot(
+            total: 1_000,
+            free: 1_200,
+            active: 800
+        )
+
+        try expect(snapshot.used == 0, "expected occupied memory to floor at zero")
+        try expect(snapshot.available == 1_000, "expected free memory to cap at total memory")
+        try expect(snapshot.physicalUsageRatio == 0, "expected physical usage ratio to floor at zero")
+        try expect(snapshot.effectiveUsageRatio == 0, "expected effective usage ratio to floor at zero")
+        try expect(snapshot.usageRatio == 0, "expected usage ratio to floor at zero")
     },
     TestCase(name: "usage ratio is zero when total memory is zero") {
         let snapshot = makeSnapshot(total: 0, active: 100)
 
         try expect(snapshot.used == 0, "expected used memory to be zero")
         try expect(snapshot.available == 0, "expected available memory to be zero")
+        try expect(snapshot.physicalUsageRatio == 0, "expected physical usage ratio to be zero")
+        try expect(snapshot.effectiveUsageRatio == 0, "expected effective usage ratio to be zero")
         try expect(snapshot.usageRatio == 0, "expected usage ratio to be zero")
     },
     TestCase(name: "activity rates use page deltas over elapsed time") {
@@ -134,11 +170,12 @@ private let tests: [TestCase] = [
         try expect(MemoryReader.pressureLevel(fromVMPressureLevel: 4) == .hot, "expected level 4 to be hot")
         try expect(MemoryReader.pressureLevel(fromVMPressureLevel: 99) == .calm, "expected unknown level to be calm")
     },
-    TestCase(name: "CPU limit mode titles match menu labels") {
+    TestCase(name: "duty-cycle mode titles describe run time rather than CPU percentage") {
         try expect(ProcessLimitMode.background.title == "Background Priority", "expected background title")
-        try expect(ProcessLimitMode.throttle(0.75).title == "Throttle to 75%", "expected 75 percent title")
-        try expect(ProcessLimitMode.throttle(0.50).title == "Throttle to 50%", "expected 50 percent title")
-        try expect(ProcessLimitMode.throttle(0.25).title == "Throttle to 25%", "expected 25 percent title")
+        try expect(ProcessLimitMode.dutyCycle(0.75).title == "Run 75% of Time", "expected 75 percent title")
+        try expect(ProcessLimitMode.dutyCycle(0.50).title == "Run 50% of Time", "expected 50 percent title")
+        try expect(ProcessLimitMode.dutyCycle(0.25).title == "Run 25% of Time", "expected 25 percent title")
+        try expect(ProcessLimitMode.dutyCycle(0).title == "Run 5% of Time", "expected safe minimum title")
     },
     TestCase(name: "ps line parser keeps command names containing spaces") {
         let process = try require(
@@ -218,6 +255,100 @@ private let tests: [TestCase] = [
             ),
             "expected ordinary app to stay visible"
         )
+    },
+    TestCase(name: "process snapshot limit validation cannot trap on negative values") {
+        let process = ProcessMemorySnapshot(pid: 42, name: "Example", memory: 1_024, cpu: 1)
+        let internalSnapshot = ProcessMemoryReader.snapshot(
+            from: [process],
+            memoryLimit: -1,
+            cpuLimit: -1,
+            currentPID: 999
+        )
+        try expect(internalSnapshot.topMemoryProcesses.isEmpty, "expected negative internal memory limit to clamp to zero")
+        try expect(internalSnapshot.topCPUProcesses.isEmpty, "expected negative internal CPU limit to clamp to zero")
+
+        var rejectedPublicLimit = false
+        do {
+            _ = try ProcessMemoryReader.snapshot(memoryLimit: -1, cpuLimit: 1)
+        } catch ProcessSnapshotError.invalidLimit {
+            rejectedPublicLimit = true
+        }
+        try expect(rejectedPublicLimit, "expected public snapshot API to reject negative limits")
+    },
+    TestCase(name: "live process snapshot succeeds within requested limits") {
+        let snapshot = try ProcessMemoryReader.snapshot(memoryLimit: 3, cpuLimit: 4)
+        try expect(snapshot.topMemoryProcesses.count <= 3, "expected memory result limit")
+        try expect(snapshot.topCPUProcesses.count <= 4, "expected CPU result limit")
+        try expect(
+            !snapshot.topMemoryProcesses.isEmpty || !snapshot.topCPUProcesses.isEmpty,
+            "expected live process snapshot to contain visible processes"
+        )
+    },
+    TestCase(name: "process identity detects PID reuse through start time") {
+        let pid = Int(Darwin.getpid())
+        let identity = try require(ProcessLimiter.identity(pid: pid), "expected current process identity")
+        try expect(identity.pid == pid, "expected identity PID")
+        try expect(identity.userID == UInt32(Darwin.geteuid()), "expected identity owner")
+        try expect(ProcessLimiter.matches(identity), "expected captured identity to match")
+
+        let changedMicroseconds = (identity.startTimeMicroseconds + 1) % 1_000_000
+        let reusedPIDIdentity = ProcessIdentity(
+            pid: identity.pid,
+            userID: identity.userID,
+            startTimeSeconds: identity.startTimeSeconds,
+            startTimeMicroseconds: changedMicroseconds
+        )
+        try expect(!ProcessLimiter.matches(reusedPIDIdentity), "expected changed start time to reject reused PID")
+        try expect(!ProcessLimiter.resume(identity: reusedPIDIdentity), "expected signal API to reject stale identity")
+    },
+    TestCase(name: "process signal API rejects unsafe PIDs and different owners") {
+        try expect(ProcessLimiter.identity(pid: 0) == nil, "expected PID zero to be invalid")
+        try expect(!ProcessLimiter.processExists(pid: 0), "expected PID zero to be uncontrollable")
+        try expect(!ProcessLimiter.processExists(pid: 1), "expected launchd PID to be uncontrollable")
+
+        let current = try require(
+            ProcessLimiter.identity(pid: Int(Darwin.getpid())),
+            "expected current process identity"
+        )
+        let otherUserID = current.userID == UInt32.max ? current.userID - 1 : current.userID + 1
+        let otherOwner = ProcessIdentity(
+            pid: current.pid,
+            userID: otherUserID,
+            startTimeSeconds: current.startTimeSeconds,
+            startTimeMicroseconds: current.startTimeMicroseconds
+        )
+        try expect(!ProcessLimiter.resume(identity: otherOwner), "expected different owner to be rejected before signaling")
+    },
+    TestCase(name: "protected process names cannot enter the limiter") {
+        for name in ["WindowServer", "kernel_task", "System UI Server", "Finder", "Memory Penguin"] {
+            try expect(ProcessLimiter.isProtectedProcessName(name), "expected \(name) to be protected")
+        }
+        try expect(!ProcessLimiter.isProtectedProcessName("Xcode"), "expected ordinary user app to remain controllable")
+
+        let pid = Int(Darwin.getpid())
+        var rejectedCurrentProcess = false
+        do {
+            _ = try ProcessLimiter.controllableIdentity(pid: pid, name: "Test Process")
+        } catch ProcessControlError.currentProcess {
+            rejectedCurrentProcess = true
+        }
+        try expect(rejectedCurrentProcess, "expected current process to be protected")
+
+        var rejectedProtectedName = false
+        do {
+            _ = try ProcessLimiter.controllableIdentity(pid: pid, name: "Finder", currentPID: -1)
+        } catch ProcessControlError.protectedProcess {
+            rejectedProtectedName = true
+        }
+        try expect(rejectedProtectedName, "expected protected name to be rejected")
+
+        var rejectedKernelName = false
+        do {
+            _ = try ProcessLimiter.controllableIdentity(pid: pid, name: "Xcode", currentPID: -1)
+        } catch ProcessControlError.protectedProcess {
+            rejectedKernelName = true
+        }
+        try expect(rejectedKernelName, "expected kernel process name to enforce protection")
     }
 ]
 

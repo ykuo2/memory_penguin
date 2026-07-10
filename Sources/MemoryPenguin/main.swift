@@ -22,6 +22,148 @@ private final class ProcessLimitMenuSelection: NSObject {
     }
 }
 
+private enum ResumeGuardCommand {
+    private static let flag = "--resume-guard"
+    private static let heartbeatTimeoutMilliseconds: Int32 = 2_000
+
+    static func arguments(for identity: ProcessIdentity) -> [String] {
+        [
+            flag,
+            "\(identity.pid)",
+            "\(identity.userID)",
+            "\(identity.startTimeSeconds)",
+            "\(identity.startTimeMicroseconds)"
+        ]
+    }
+
+    static func runIfRequested(arguments: [String] = CommandLine.arguments) -> Int32? {
+        guard arguments.dropFirst().first == flag else {
+            return nil
+        }
+        guard arguments.count == 6,
+              let pid = Int(arguments[2]),
+              let userID = UInt32(arguments[3]),
+              let startTimeSeconds = UInt64(arguments[4]),
+              let startTimeMicroseconds = UInt64(arguments[5]),
+              pid > 1,
+              startTimeMicroseconds < 1_000_000 else {
+            return EXIT_FAILURE
+        }
+
+        waitForHeartbeatLoss()
+        let identity = ProcessIdentity(
+            pid: pid,
+            userID: userID,
+            startTimeSeconds: startTimeSeconds,
+            startTimeMicroseconds: startTimeMicroseconds
+        )
+        guard ProcessLimiter.resume(identity: identity) else {
+            fputs("Resume guard could not validate or resume PID \(pid).\n", stderr)
+            return EXIT_FAILURE
+        }
+        try? ProcessLimiter.setBackgroundPolicy(identity: identity, enabled: false)
+        return EXIT_SUCCESS
+    }
+
+    private static func waitForHeartbeatLoss() {
+        let watchedEvents = Int16(POLLIN) | Int16(POLLHUP) | Int16(POLLERR) | Int16(POLLNVAL)
+        var descriptor = pollfd(fd: STDIN_FILENO, events: watchedEvents, revents: 0)
+        var buffer = [UInt8](repeating: 0, count: 64)
+
+        while true {
+            descriptor.revents = 0
+            let result = Darwin.poll(&descriptor, 1, heartbeatTimeoutMilliseconds)
+            if result == 0 {
+                return
+            }
+            if result < 0 {
+                if errno == EINTR {
+                    continue
+                }
+                return
+            }
+
+            if descriptor.revents & Int16(POLLIN) != 0 {
+                let bytesRead = buffer.withUnsafeMutableBytes { bytes in
+                    Darwin.read(STDIN_FILENO, bytes.baseAddress, bytes.count)
+                }
+                if bytesRead > 0 {
+                    continue
+                }
+                return
+            }
+
+            if descriptor.revents & (Int16(POLLHUP) | Int16(POLLERR) | Int16(POLLNVAL)) != 0 {
+                return
+            }
+        }
+    }
+}
+
+@MainActor
+private final class ProcessResumeGuard {
+    private let process: Foundation.Process
+    private let heartbeatPipe: Pipe
+    private let writeDescriptor: Int32
+    private var isClosed = false
+
+    init(identity: ProcessIdentity) throws {
+        guard let executableURL = Bundle.main.executableURL else {
+            throw NSError(
+                domain: "MemoryPenguin.ResumeGuard",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Unable to locate the Memory Penguin executable."]
+            )
+        }
+
+        let heartbeatPipe = Pipe()
+        let writeDescriptor = heartbeatPipe.fileHandleForWriting.fileDescriptor
+        let descriptorFlags = Darwin.fcntl(writeDescriptor, F_GETFD)
+        guard descriptorFlags >= 0,
+              Darwin.fcntl(writeDescriptor, F_SETFD, descriptorFlags | FD_CLOEXEC) == 0,
+              Darwin.fcntl(writeDescriptor, F_SETNOSIGPIPE, 1) == 0 else {
+            throw NSError(
+                domain: "MemoryPenguin.ResumeGuard",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Unable to configure the resume guard heartbeat."]
+            )
+        }
+
+        let process = Foundation.Process()
+        process.executableURL = executableURL
+        process.arguments = ResumeGuardCommand.arguments(for: identity)
+        process.standardInput = heartbeatPipe
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        heartbeatPipe.fileHandleForReading.closeFile()
+
+        self.process = process
+        self.heartbeatPipe = heartbeatPipe
+        self.writeDescriptor = writeDescriptor
+    }
+
+    func heartbeat() -> Bool {
+        guard !isClosed, process.isRunning else {
+            return false
+        }
+
+        var byte: UInt8 = 1
+        let bytesWritten = withUnsafePointer(to: &byte) { pointer in
+            Darwin.write(writeDescriptor, pointer, 1)
+        }
+        return bytesWritten == 1
+    }
+
+    func close() {
+        guard !isClosed else {
+            return
+        }
+        isClosed = true
+        heartbeatPipe.fileHandleForWriting.closeFile()
+    }
+}
+
 @MainActor
 enum PenguinIconFactory {
     private static var cachedIcons: [MemoryPressureLevel: NSImage] = [:]
@@ -152,7 +294,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let menu = NSMenu()
     private let summaryItem = AppDelegate.makeDisabledItem()
     private let totalItem = AppDelegate.makeDisabledItem()
-    private let usedItem = AppDelegate.makeDisabledItem()
+    private let effectiveUsedItem = AppDelegate.makeDisabledItem()
+    private let physicalOccupiedItem = AppDelegate.makeDisabledItem()
+    private let reclaimableItem = AppDelegate.makeDisabledItem()
     private let availableItem = AppDelegate.makeDisabledItem()
     private let appMemoryItem = AppDelegate.makeDisabledItem()
     private let cacheItem = AppDelegate.makeDisabledItem()
@@ -215,6 +359,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var limitedProcesses: [Int: LimitedProcess] = [:]
     private var limitedProcessOrder: [Int] = []
     private var limitedProcessMenuItems: [NSMenuItem] = []
+    private var resumeGuards: [Int: ProcessResumeGuard] = [:]
     private var processLimitTimer: Timer?
     private var latestSnapshot: MemorySnapshot?
     private var showsPercentage: Bool {
@@ -243,7 +388,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         [
             overviewSeparatorItem,
             totalItem,
-            usedItem,
+            effectiveUsedItem,
+            physicalOccupiedItem,
+            reclaimableItem,
             availableItem,
             appMemoryItem,
             cacheItem,
@@ -283,6 +430,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for pid in Array(limitedProcessOrder) {
             removeProcessLimit(pid: pid, shouldResetPolicy: true, shouldRefreshMenu: false)
         }
+        resumeGuards.values.forEach { $0.close() }
+        resumeGuards.removeAll()
         processLimitTimer?.invalidate()
         processLimitTimer = nil
     }
@@ -305,24 +454,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateStatusItem(with snapshot: MemorySnapshot) {
-        let percent = Int((snapshot.usageRatio * 100).rounded())
+        let percent = Int((snapshot.effectiveUsageRatio * 100).rounded())
         statusItem.button?.title = showsPercentage ? " \(percent)%" : ""
         statusItem.button?.image = PenguinIconFactory.image(for: snapshot.pressureLevel)
-        statusItem.button?.toolTip = "Memory Usage: \(percent)%"
+        statusItem.button?.toolTip = "Effective Used Estimate: \(percent)% (\(ByteFormatter.string(snapshot.effectiveUsedEstimate)))"
     }
 
     private func updateMenu(with snapshot: MemorySnapshot) {
-        let percent = Int((snapshot.usageRatio * 100).rounded())
+        let percent = Int((snapshot.effectiveUsageRatio * 100).rounded())
 
-        summaryItem.title = "Memory Penguin: \(snapshot.pressureLevel.title) Pressure / \(percent)% Used"
+        summaryItem.title = "Memory Penguin: \(snapshot.pressureLevel.title) Pressure / \(percent)% Effective Used Estimate"
         totalItem.title = "Total Memory: \(ByteFormatter.string(snapshot.total))"
-        usedItem.title = "Used: \(ByteFormatter.string(snapshot.used))"
-        availableItem.title = "Available: \(ByteFormatter.string(snapshot.available))"
-        appMemoryItem.title = "App Memory: \(ByteFormatter.string(snapshot.appMemory))"
-        cacheItem.title = "Cache: \(ByteFormatter.string(snapshot.cache))"
-        fileBackedItem.title = "File-Backed Cache: \(ByteFormatter.string(snapshot.fileBacked))"
-        anonymousItem.title = "Anonymous: \(ByteFormatter.string(snapshot.anonymous))"
-        freeItem.title = "Free: \(ByteFormatter.string(snapshot.free))"
+        effectiveUsedItem.title = "Effective Used Estimate: \(ByteFormatter.string(snapshot.effectiveUsedEstimate))"
+        physicalOccupiedItem.title = "Physical Occupied: \(ByteFormatter.string(snapshot.physicalOccupied))"
+        reclaimableItem.title = "Reclaimable Estimate: \(ByteFormatter.string(snapshot.reclaimableEstimate))"
+        availableItem.title = "Free (Includes Speculative): \(ByteFormatter.string(snapshot.available))"
+        appMemoryItem.title = "Anonymous Estimate: \(ByteFormatter.string(snapshot.appMemory))"
+        cacheItem.title = "File-Backed Estimate: \(ByteFormatter.string(snapshot.cache))"
+        fileBackedItem.title = "File-Backed Counter: \(ByteFormatter.string(snapshot.fileBacked))"
+        anonymousItem.title = "Anonymous Counter: \(ByteFormatter.string(snapshot.anonymous))"
+        freeItem.title = "Kernel Free Counter: \(ByteFormatter.string(snapshot.free))"
         activeItem.title = "Active: \(ByteFormatter.string(snapshot.active))"
         inactiveItem.title = "Inactive: \(ByteFormatter.string(snapshot.inactive))"
         wiredItem.title = "Wired: \(ByteFormatter.string(snapshot.wired))"
@@ -350,6 +501,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateProcesses(_ snapshot: ProcessSnapshot) {
         hasProcessSnapshot = true
+        processItems.forEach { $0.toolTip = nil }
+        cpuProcessItems.forEach { $0.toolTip = nil }
         updateMemoryProcesses(snapshot.topMemoryProcesses)
         updateCPUProcesses(snapshot.topCPUProcesses)
     }
@@ -369,12 +522,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for index in cpuProcessItems.indices {
             if index < processes.count {
                 let process = processes[index]
-                cpuProcessItems[index].title = "\(index + 1). \(process.name): \(ByteFormatter.percent(process.cpu))"
-                cpuProcessItems[index].target = self
-                cpuProcessItems[index].action = #selector(addCPUProcessToLimits(_:))
+                let isProtected = ProcessLimiter.isProtectedProcessName(process.name)
+                let protectionLabel = isProtected ? " (Protected)" : ""
+                cpuProcessItems[index].title = "\(index + 1). \(process.name): \(ByteFormatter.percent(process.cpu))\(protectionLabel)"
+                cpuProcessItems[index].target = isProtected ? nil : self
+                cpuProcessItems[index].action = isProtected ? nil : #selector(addCPUProcessToLimits(_:))
                 cpuProcessItems[index].representedObject = ProcessMenuSelection(process: process)
-                cpuProcessItems[index].isEnabled = true
-                cpuProcessItems[index].state = limitedProcesses[process.pid] == nil ? .off : .on
+                cpuProcessItems[index].isEnabled = !isProtected
+                let limitedProcess = limitedProcesses[process.pid]
+                cpuProcessItems[index].state = limitedProcess.map { ProcessLimiter.matches($0.identity) } == true ? .on : .off
             } else {
                 cpuProcessItems[index].title = "\(index + 1). --"
                 cpuProcessItems[index].target = nil
@@ -406,22 +562,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         processQueue.async { [weak self] in
-            let snapshot = ProcessMemoryReader.snapshot(memoryLimit: 5, cpuLimit: 5)
+            let result: Result<ProcessSnapshot, ProcessSnapshotError>
+            do {
+                result = .success(try ProcessMemoryReader.snapshot(memoryLimit: 5, cpuLimit: 5))
+            } catch let error as ProcessSnapshotError {
+                result = .failure(error)
+            } catch {
+                result = .failure(.unableToLaunch(error.localizedDescription))
+            }
 
             Task { @MainActor [weak self] in
-                self?.finishProcessRefresh(snapshot, generation: generation)
+                self?.finishProcessRefresh(result, generation: generation)
             }
         }
     }
 
-    private func finishProcessRefresh(_ snapshot: ProcessSnapshot, generation: Int) {
+    private func finishProcessRefresh(
+        _ result: Result<ProcessSnapshot, ProcessSnapshotError>,
+        generation: Int
+    ) {
         isProcessRefreshInFlight = false
 
         guard isMenuOpen, generation == processRefreshGeneration else {
             return
         }
 
-        updateProcesses(snapshot)
+        switch result {
+        case .success(let snapshot):
+            updateProcesses(snapshot)
+        case .failure(let error):
+            showProcessRefreshError(error)
+        }
+    }
+
+    private func showProcessRefreshError(_ error: ProcessSnapshotError) {
+        hasProcessSnapshot = false
+        updateMemoryProcesses([])
+        updateCPUProcesses([])
+        let message = error.localizedDescription
+        processItems.first?.title = "Process list unavailable"
+        processItems.first?.toolTip = message
+        cpuProcessItems.first?.title = "Process list unavailable"
+        cpuProcessItems.first?.toolTip = message
     }
 
     @objc private func addCPUProcessToLimits(_ sender: NSMenuItem) {
@@ -430,31 +612,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let process = selection.process
-        guard process.pid != Int(Darwin.getpid()) else {
-            showErrorAlert(
-                title: "Unable to Limit Process",
-                message: "Memory Penguin cannot add itself to the limited process list."
-            )
-            return
-        }
-
-        guard ProcessLimiter.processExists(pid: process.pid) else {
-            showErrorAlert(title: "Process Has Exited", message: "\(process.name) is no longer running.")
-            return
-        }
-
-        if limitedProcesses[process.pid] != nil {
+        if let limitedProcess = limitedProcesses[process.pid], ProcessLimiter.matches(limitedProcess.identity) {
             removeProcessLimit(pid: process.pid, shouldResetPolicy: true, shouldRefreshMenu: true)
             return
         }
+        if limitedProcesses[process.pid] != nil {
+            removeProcessLimit(pid: process.pid, shouldResetPolicy: false, shouldRefreshMenu: false)
+        }
 
         do {
-            try ProcessLimiter.setBackgroundPolicy(pid: process.pid, enabled: true)
+            let identity = try ProcessLimiter.controllableIdentity(pid: process.pid, name: process.name)
+            try ProcessLimiter.setBackgroundPolicy(identity: identity, enabled: true)
             limitedProcesses[process.pid] = LimitedProcess(
-                pid: process.pid,
+                identity: identity,
                 name: process.name,
                 mode: .background,
-                modeStartedAt: Date(),
+                modeStartedUptime: ProcessInfo.processInfo.systemUptime,
                 isRunning: true,
                 hasBackgroundPolicy: true
             )
@@ -466,7 +639,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } catch {
             showErrorAlert(
                 title: "Unable to Limit Process",
-                message: "\(process.name) could not be moved to background priority.\n\n\(error.localizedDescription)"
+                message: "\(process.name) could not be limited.\n\n\(error.localizedDescription)"
             )
         }
     }
@@ -500,46 +673,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard var process = limitedProcesses[pid] else {
             return
         }
-        guard ProcessLimiter.processExists(pid: pid) else {
+        guard ProcessLimiter.matches(process.identity) else {
             removeProcessLimit(pid: pid, shouldResetPolicy: false, shouldRefreshMenu: true)
-            return
+            throw ProcessControlError.identityChanged(pid)
         }
 
         if !process.hasBackgroundPolicy {
-            try ProcessLimiter.setBackgroundPolicy(pid: pid, enabled: true)
+            try ProcessLimiter.setBackgroundPolicy(identity: process.identity, enabled: true)
             process.hasBackgroundPolicy = true
         }
 
         switch mode {
         case .background:
-            ProcessLimiter.resume(pid: pid)
+            guard ProcessLimiter.resume(identity: process.identity) else {
+                throw ProcessControlError.identityChanged(pid)
+            }
+            closeResumeGuard(pid: pid)
             process.isRunning = true
-        case .throttle:
-            guard ProcessLimiter.resume(pid: pid) else {
+        case .dutyCycle:
+            if resumeGuards[pid] == nil {
+                resumeGuards[pid] = try ProcessResumeGuard(identity: process.identity)
+            }
+            guard resumeGuards[pid]?.heartbeat() == true,
+                  ProcessLimiter.resume(identity: process.identity) else {
+                closeResumeGuard(pid: pid)
                 throw NSError(
                     domain: "MemoryPenguin.ProcessLimiter",
                     code: 2,
-                    userInfo: [NSLocalizedDescriptionKey: "Memory Penguin cannot send control signals to PID \(pid)."]
+                    userInfo: [NSLocalizedDescriptionKey: "The resume guard could not protect PID \(pid)."]
                 )
             }
             process.isRunning = true
         }
 
         process.mode = mode
-        process.modeStartedAt = Date()
+        process.modeStartedUptime = ProcessInfo.processInfo.systemUptime
         limitedProcesses[pid] = process
         updateProcessLimitTimer()
     }
 
+    private func closeResumeGuard(pid: Int) {
+        resumeGuards.removeValue(forKey: pid)?.close()
+    }
+
     private func removeProcessLimit(pid: Int, shouldResetPolicy: Bool, shouldRefreshMenu: Bool) {
-        if let process = limitedProcesses[pid], !process.isRunning {
-            ProcessLimiter.resume(pid: pid)
+        if let process = limitedProcesses[pid], ProcessLimiter.matches(process.identity) {
+            _ = ProcessLimiter.resume(identity: process.identity)
+            if shouldResetPolicy, process.hasBackgroundPolicy {
+                try? ProcessLimiter.setBackgroundPolicy(identity: process.identity, enabled: false)
+            }
         }
 
-        if shouldResetPolicy, limitedProcesses[pid]?.hasBackgroundPolicy == true {
-            try? ProcessLimiter.setBackgroundPolicy(pid: pid, enabled: false)
-        }
-
+        closeResumeGuard(pid: pid)
         limitedProcesses.removeValue(forKey: pid)
         limitedProcessOrder.removeAll { $0 == pid }
         updateProcessLimitTimer()
@@ -555,7 +740,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func pruneExitedLimitedProcesses() {
         var didRemoveProcess = false
 
-        for pid in Array(limitedProcessOrder) where !ProcessLimiter.processExists(pid: pid) {
+        for pid in Array(limitedProcessOrder) {
+            guard let process = limitedProcesses[pid], !ProcessLimiter.matches(process.identity) else {
+                continue
+            }
             removeProcessLimit(pid: pid, shouldResetPolicy: false, shouldRefreshMenu: false)
             didRemoveProcess = true
         }
@@ -570,27 +758,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func enforceProcessLimits() {
         var shouldRefreshMenu = false
-        let now = Date()
+        let now = ProcessInfo.processInfo.systemUptime
 
         for pid in Array(limitedProcessOrder) {
             guard var process = limitedProcesses[pid] else {
                 continue
             }
 
-            guard ProcessLimiter.processExists(pid: pid) else {
+            guard ProcessLimiter.matches(process.identity) else {
                 removeProcessLimit(pid: pid, shouldResetPolicy: false, shouldRefreshMenu: false)
                 shouldRefreshMenu = true
                 continue
             }
 
-            guard case .throttle(let allowedCPU) = process.mode else {
+            guard case .dutyCycle(let runFraction) = process.mode else {
+                continue
+            }
+            guard resumeGuards[pid]?.heartbeat() == true else {
+                removeProcessLimit(pid: pid, shouldResetPolicy: true, shouldRefreshMenu: false)
+                shouldRefreshMenu = true
                 continue
             }
 
             let period: TimeInterval = 1
-            let runDuration = period * min(1, max(0.05, allowedCPU))
-            let phase = now.timeIntervalSince(process.modeStartedAt)
-                .truncatingRemainder(dividingBy: period)
+            let runDuration = period * min(1, max(0.05, runFraction))
+            let elapsed = max(0, now - process.modeStartedUptime)
+            let phase = elapsed.truncatingRemainder(dividingBy: period)
             let shouldRun = phase < runDuration
 
             guard shouldRun != process.isRunning else {
@@ -598,14 +791,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             let didSendSignal = shouldRun
-                ? ProcessLimiter.resume(pid: pid)
-                : ProcessLimiter.suspend(pid: pid)
+                ? ProcessLimiter.resume(identity: process.identity)
+                : ProcessLimiter.suspend(identity: process.identity)
 
             if didSendSignal {
                 process.isRunning = shouldRun
                 limitedProcesses[pid] = process
             } else {
-                removeProcessLimit(pid: pid, shouldResetPolicy: false, shouldRefreshMenu: false)
+                removeProcessLimit(pid: pid, shouldResetPolicy: true, shouldRefreshMenu: false)
                 shouldRefreshMenu = true
             }
         }
@@ -620,7 +813,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateProcessLimitTimer() {
         let needsTimer = limitedProcesses.values.contains {
-            if case .throttle = $0.mode {
+            if case .dutyCycle = $0.mode {
                 return true
             }
             return false
@@ -672,9 +865,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let submenu = NSMenu()
         let modes: [ProcessLimitMode] = [
             .background,
-            .throttle(0.75),
-            .throttle(0.50),
-            .throttle(0.25)
+            .dutyCycle(0.75),
+            .dutyCycle(0.50),
+            .dutyCycle(0.25)
         ]
 
         for mode in modes {
@@ -710,7 +903,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             summaryItem,
             overviewSeparatorItem,
             totalItem,
-            usedItem,
+            effectiveUsedItem,
+            physicalOccupiedItem,
+            reclaimableItem,
             availableItem,
             appMemoryItem,
             cacheItem,
@@ -900,6 +1095,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func quit() {
         NSApp.terminate(nil)
     }
+}
+
+if let resumeGuardExitCode = ResumeGuardCommand.runIfRequested() {
+    exit(resumeGuardExitCode)
 }
 
 let app = NSApplication.shared

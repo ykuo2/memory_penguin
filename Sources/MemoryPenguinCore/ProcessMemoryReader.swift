@@ -2,10 +2,34 @@ import AppKit
 import Darwin
 import Foundation
 
+public enum ProcessSnapshotError: Error, LocalizedError, Sendable {
+    case invalidLimit
+    case unableToLaunch(String)
+    case commandFailed(Int32, String)
+    case invalidOutput
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidLimit:
+            return "Process list limits cannot be negative."
+        case .unableToLaunch(let message):
+            return "Unable to start ps: \(message)"
+        case .commandFailed(let status, let message):
+            return message.isEmpty ? "ps exited with status \(status)." : "ps failed: \(message)"
+        case .invalidOutput:
+            return "ps returned output that is not valid UTF-8."
+        }
+    }
+}
+
 public enum ProcessMemoryReader {
-    public static func snapshot(memoryLimit: Int = 5, cpuLimit: Int = 5) -> ProcessSnapshot {
-        snapshot(
-            from: readProcesses(),
+    public static func snapshot(memoryLimit: Int = 5, cpuLimit: Int = 5) throws -> ProcessSnapshot {
+        guard memoryLimit >= 0, cpuLimit >= 0 else {
+            throw ProcessSnapshotError.invalidLimit
+        }
+
+        return snapshot(
+            from: try readProcesses(),
             memoryLimit: memoryLimit,
             cpuLimit: cpuLimit,
             currentPID: Int(Darwin.getpid())
@@ -26,7 +50,7 @@ public enum ProcessMemoryReader {
                 }
                 return $0.memory > $1.memory
             }
-            .prefix(memoryLimit)
+            .prefix(max(0, memoryLimit))
         let topCPUProcesses = visibleProcesses
             .sorted {
                 if $0.cpu == $1.cpu {
@@ -34,7 +58,7 @@ public enum ProcessMemoryReader {
                 }
                 return $0.cpu > $1.cpu
             }
-            .prefix(cpuLimit)
+            .prefix(max(0, cpuLimit))
 
         return ProcessSnapshot(
             topMemoryProcesses: Array(topMemoryProcesses),
@@ -97,29 +121,33 @@ public enum ProcessMemoryReader {
             || normalizedName == "kernel"
     }
 
-    private static func readProcesses() -> [ProcessMemorySnapshot] {
+    private static func readProcesses() throws -> [ProcessMemorySnapshot] {
         let task = Foundation.Process()
         task.executableURL = URL(fileURLWithPath: "/bin/ps")
         task.arguments = ["-axo", "pid=,rss=,pcpu=,comm="]
 
         let outputPipe = Pipe()
-        let errorPipe = Pipe()
         task.standardOutput = outputPipe
-        task.standardError = errorPipe
+        task.standardError = outputPipe
 
         do {
             try task.run()
         } catch {
-            return []
+            throw ProcessSnapshotError.unableToLaunch(error.localizedDescription)
         }
 
         let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        _ = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
         outputPipe.fileHandleForReading.closeFile()
-        errorPipe.fileHandleForReading.closeFile()
 
         guard let output = String(data: outputData, encoding: .utf8) else {
-            return []
+            throw ProcessSnapshotError.invalidOutput
+        }
+        guard task.terminationStatus == 0 else {
+            throw ProcessSnapshotError.commandFailed(
+                task.terminationStatus,
+                output.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
         }
 
         return parsePSOutput(output)

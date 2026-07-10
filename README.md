@@ -4,7 +4,7 @@
   <img src="Resources/icon.png" alt="Memory Penguin app icon" width="128">
 </p>
 
-Memory Penguin is a lightweight macOS menu bar app that shows current memory pressure with a small penguin icon. Click the menu bar icon to inspect memory usage, swap activity, top memory processes, top CPU processes, and temporary CPU limits for selected high-usage processes.
+Memory Penguin is a lightweight macOS menu bar app that shows current memory pressure with a small penguin icon. Click the menu bar icon to inspect effective memory use, physical occupancy, swap activity, top memory processes, top CPU processes, and temporary CPU controls for selected high-usage processes.
 
 The app is built with Swift and AppKit. It does not require Electron or any extra runtime.
 
@@ -42,7 +42,7 @@ The menu bar uses three pre-generated 48 x 44 transparent PNG assets. The app lo
 
 ## Features
 
-- Shows current memory usage percentage and memory pressure state in the menu bar.
+- Shows the effective used memory estimate percentage and memory pressure state in the menu bar.
 - Uses three penguin icon states for memory pressure:
   - Calm: short green mark
   - Elevated: medium yellow mark
@@ -52,13 +52,13 @@ The menu bar uses three pre-generated 48 x 44 transparent PNG assets. The app lo
 - Enables or disables Launch at Login.
 - Displays memory details:
   - Total
-  - Used
-  - Available
-  - App Memory
-  - Cache
-  - File-backed cache
-  - Anonymous
-  - Free
+  - Effective used estimate
+  - Physical occupied
+  - Reclaimable estimate
+  - Kernel free, including speculative pages
+  - Bounded anonymous estimate
+  - Bounded file-backed estimate
+  - Raw file-backed and anonymous counters
   - Active
   - Inactive
   - Wired
@@ -72,11 +72,13 @@ The menu bar uses three pre-generated 48 x 44 transparent PNG assets. The app lo
 - Lets you click a top CPU process to add it to a temporary CPU limit list.
 - Supports these CPU limit modes:
   - Background Priority
-  - Throttle to 75%
-  - Throttle to 50%
-  - Throttle to 25%
+  - Run 75% of Time
+  - Run 50% of Time
+  - Run 25% of Time
   - Remove Limit
-- Excludes Memory Penguin's own process from CPU limiting so the app cannot throttle itself.
+- Validates each limited process by PID, owner UID, and microsecond-resolution start time before every control signal.
+- Rejects PID 0/1, other users' processes, Memory Penguin itself, and protected macOS interface or system processes.
+- Uses an independent heartbeat resume guard so a stopped process is resumed if Memory Penguin exits unexpectedly or its main loop stops responding.
 
 ## Requirements
 
@@ -144,7 +146,7 @@ Scripts/build-app.sh
 open dist/MemoryPenguin.app
 ```
 
-For each intentional release or user-facing change, update `CFBundleShortVersionString` in `Resources/Info.plist`. `Scripts/build-app.sh` reads that version and updates the bundled `CFBundleVersion` to a timestamp build number.
+For each intentional release or user-facing change, add an entry under `Unreleased` in [`CHANGELOG.md`](CHANGELOG.md). When preparing a release, move those entries into a dated version section and update `CFBundleShortVersionString` in `Resources/Info.plist` to the same version. `Scripts/build-app.sh` reads that version and updates the bundled `CFBundleVersion` to a timestamp build number.
 
 Regenerate the transparent status icons and README previews after changing the source sprite sheet:
 
@@ -162,17 +164,28 @@ Run the core self-tests from the project root:
 swift run MemoryPenguinCoreSelfTests
 ```
 
-The self-test executable verifies the reusable core logic without launching the menu bar app. It covers derived memory calculations, activity rate calculations, memory pressure mapping, `ps` output parsing, process sorting and filtering, and CPU limit mode labels.
+The self-test executable verifies the reusable core logic without launching the menu bar app. It covers effective used, reclaimable, and physical occupancy calculations; activity rates; memory pressure mapping; `ps` parsing; process sorting; PID reuse detection; owner and protected-process checks; and duty-cycle labels.
+
+Run the resume guard integration test after building the executable:
+
+```bash
+swift build --product MemoryPenguin
+swift Scripts/ResumeGuardIntegrationTest.swift
+```
+
+The integration test creates its own `/bin/sleep` children, confirms they enter `SSTOP`, and verifies that both a closed heartbeat pipe and a two-second heartbeat timeout restore them.
 
 ## CPU Limiting
 
-CPU limiting is session-based and applies only to the selected PID. When the process exits, the limit disappears.
+CPU limiting is session-based. A limit is bound to the selected PID, effective owner UID, and process start time; if the PID exits and is reused, Memory Penguin refuses to signal the replacement process.
 
 `Background Priority` uses macOS `taskpolicy -b`. This is a gentle limit that lowers scheduling priority, but it does not guarantee a fixed CPU percentage.
 
-Percentage throttle modes use periodic `SIGSTOP` / `SIGCONT` signals to pause and resume the process. For example, 50% throttle roughly lets the process run half of the time and pause half of the time. This is closer to a hard throttle, but the limited app may become temporarily unresponsive, especially for GUI apps, audio apps, download tools, compilers, or long-running I/O tasks.
+Duty-cycle modes use periodic `SIGSTOP` / `SIGCONT` signals to pause and resume the process. `Run 50% of Time` means the process runs for roughly half of each one-second period; it does not mean an absolute 50% CPU ceiling. A four-worker process that previously consumed about 400% CPU may still average around 200% CPU under this mode.
 
-When a limit is removed or Memory Penguin quits, the app attempts to resume any paused process and remove background priority.
+Each duty-cycle process has a helper mode of the same signed executable watching a heartbeat pipe. If Memory Penguin crashes or is force-quit, the pipe closes and the helper resumes the exact original process. If the app remains alive but stops sending heartbeats, the helper resumes the process after two seconds. Normal removal also resumes the process and removes background priority.
+
+Duty-cycle control can still make GUI, audio, download, compiler, or I/O-heavy applications temporarily unresponsive. Protected system processes and processes owned by another user are not controllable.
 
 ## CPU Limit Testing
 
@@ -197,7 +210,7 @@ Test flow:
 2. Open the Memory Penguin menu.
 3. Find `CPUStressTest` under `Top CPU Processes`.
 4. Click `CPUStressTest` to add it to `Limited Processes`.
-5. Choose `Throttle to 50%` or another limit mode from the submenu.
+5. Choose `Run 50% of Time` or another limit mode from the submenu.
 6. Click the checked top CPU process again, or choose `Remove Limit` from the `Limited Processes` submenu, to remove the limit.
 
 ## Resource Use
@@ -218,7 +231,7 @@ Process list source:
 /bin/ps -axo pid=,rss=,pcpu=,comm=
 ```
 
-The app reads a `ps` snapshot and sorts the processes in app code.
+The app reads a `ps` snapshot and sorts the processes in app code. Launch failures, nonzero exits, and invalid output are shown as `Process list unavailable` rather than being presented as an empty process list.
 
 ## Memory Pressure Model
 
@@ -228,13 +241,19 @@ Activity Monitor's full memory pressure formula is not a public API. Memory Peng
 - Elevated
 - High
 
-The percentage shown in the menu bar is memory usage percentage, not Activity Monitor's private memory pressure percentage.
+The percentage shown in the menu bar is an effective used memory estimate, not Activity Monitor's private memory pressure percentage. macOS memory pressure remains the authoritative health signal.
 
-Current usage model:
+Current memory model:
 
-- Used memory: active + inactive + speculative + wired + compressed - purgeable - file-backed cache
-- App memory: used - wired - compressed
-- Cache: purgeable + file-backed cache
+- Physical occupied: total physical memory - kernel free count
+- Kernel free: capped to total physical memory; `vm_statistics64` documents that this count already includes speculative pages
+- Non-free file-backed estimate: file-backed memory - speculative memory, floored at zero
+- Reclaimable estimate: non-free file-backed estimate + purgeable memory, capped to physical occupied memory
+- Effective used estimate: physical occupied - reclaimable estimate
+- Anonymous estimate: anonymous counter capped to physical occupied memory
+- File-backed estimate: file-backed counter capped to physical occupied memory
+
+Active/inactive state, anonymous/file-backed backing, and purgeable status are overlapping classification dimensions. Memory Penguin normalizes speculative pages before estimating reclaimable memory and continues to display the raw counters separately for transparency.
 
 ## Project Structure
 
@@ -248,6 +267,7 @@ Resources/memory_icon.png                     Original menu bar sprite sheet
 Resources/Generated/StatusIcons/              Bundled transparent menu bar icons
 Scripts/build-app.sh                          Build app bundle
 Scripts/CPUStressTest.swift                   CPU stress test utility
+Scripts/ResumeGuardIntegrationTest.swift      Resume guard process integration test
 Scripts/generate-icon-previews.swift          Status icon and preview generator
 ```
 
@@ -257,4 +277,4 @@ MIT License. See [LICENSE](LICENSE).
 
 ## Notes
 
-Memory Penguin is a local-use utility. The CPU throttle feature sends signals to other processes, so avoid limiting system processes, apps that are saving important data, or any workload that cannot tolerate temporary pauses.
+Memory Penguin is a local-use utility. Duty-cycle control sends signals to other processes, so avoid limiting apps that are saving important data or workloads that cannot tolerate temporary pauses.
